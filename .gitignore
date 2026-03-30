@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Datos sensibles
+data/raw/
+data/processed/
+
+# Modelos
+models/
+
+# Archivos grandes
+*.json
+
+# Mac
+.DS_Store
+
+# Entornos
+venv/
+.env
+
