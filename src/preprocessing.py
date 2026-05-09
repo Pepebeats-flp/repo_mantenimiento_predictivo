@@ -42,6 +42,122 @@ KEYWORD_PATTERNS = {
     "keyword_espejo": ("ESPEJO",),
 }
 
+CAUSA_SISTEMA_REGEX = {
+
+    "FRENOS": [
+        r"\bFRENO[S]?\b",
+        r"\bPASTILLA[S]?\b",
+        r"\bDISCO[S]?\b",
+        r"\bABS\b"
+    ],
+
+    "SUSPENSION": [
+        r"\bAMORTIGUADOR(ES)?\b",
+        r"\bSUSPENSION\b",
+        r"\bBUJE[S]?\b"
+    ],
+
+    "CARROCERIA": [
+        r"\bPUERTA[S]?\b",
+        r"\bVIDRIO[S]?\b",
+        r"\bPARACHOQUE[S]?\b"
+    ],
+
+    "CLIMATIZACION": [
+        r"\bAIRE\b",
+        r"\bVENTILADOR\b",
+        r"\bEVAPORADOR\b"
+    ],
+
+    "RUEDAS": [
+        r"\bNEUMATICO[S]?\b",
+        r"\bLLANTA[S]?\b"
+    ],
+
+    "MOTOR": [
+        r"\bMOTOR\b",
+        r"\bACEITE\b",
+        r"\bCORREA[S]?\b",
+        r"\bVALVULA[S]?\b"
+    ],
+
+    "ELECTRICO": [
+        r"\bBATERIA[S]?\b",
+        r"\bALTERNADOR\b",
+        r"\bFUSIBLE[S]?\b",
+        r"\bSENSOR(ES)?\b"
+    ]
+
+}
+
+def _reconstruct_causa_sistema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reconstruye causa técnica desde múltiples columnas de texto.
+    """
+
+    text_columns = [
+
+        "observacion_clean",
+        "repuestos_descripcion_texto_clean",
+        "uuid_gestion_texto_clean",
+        "pauta_ejecutada_clean",
+        "pauta_proyectada_clean",
+        "causa_origen_clean"
+
+    ]
+
+    existing = [
+
+        col for col in text_columns
+        if col in df.columns
+
+    ]
+
+    if not existing:
+        df["causa_sistema_reconstruida"] = "OTROS"
+        return df
+
+    df["texto_total_causa"] = (
+
+        df[existing]
+        .fillna("")
+        .astype(str)
+        .agg(" ".join, axis=1)
+
+    )
+
+    def detectar(texto):
+
+        scores = {}
+
+        for categoria, patrones in CAUSA_SISTEMA_REGEX.items():
+
+            score = 0
+
+            for patron in patrones:
+
+                score += len(
+                    re.findall(patron, texto)
+                )
+
+            scores[categoria] = score
+
+        mejor = max(scores, key=scores.get)
+
+        if scores[mejor] == 0:
+            return "OTROS"
+
+        return mejor
+
+    df["causa_sistema_reconstruida"] = (
+
+        df["texto_total_causa"]
+        .apply(detectar)
+
+    )
+
+    return df
+
 
 def _filter_deleted(records: Iterable[Any]) -> list[Any]:
     """Discard records marked as deleted."""
@@ -298,7 +414,7 @@ def extract_additional_fields(df: pd.DataFrame) -> pd.DataFrame:
     enriched_df = clean_textual_fields(enriched_df)
     enriched_df = normalize_categorical_columns(enriched_df)
     enriched_df = _add_keyword_indicators(enriched_df, "repuestos_descripcion_texto_clean")
-
+    enriched_df = _reconstruct_causa_sistema(enriched_df) 
     for source, target in (
         ("repuestos_count", "tiene_repuestos"),
         ("uuid_gestion_count", "tiene_uuid_gestion"),
