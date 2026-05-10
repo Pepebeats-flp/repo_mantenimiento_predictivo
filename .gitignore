@@ -5,13 +5,6 @@ __pycache__/
 # Jupyter
 .ipynb_checkpoints/
 
-# Datos sensibles
-data/raw/
-data/processed/
-
-# Modelos
-models/
-
 # Archivos grandes
 *.json
 

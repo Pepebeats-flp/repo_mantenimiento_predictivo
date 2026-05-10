@@ -1,0 +1,16 @@
+feature,importance
+taller_workload_30d,0.3655378600857252
+bus_total_event_count,0.13248329360642513
+event_count_60d,0.0815161577030342
+dias_desde_ultimo_correctivo,0.07705827365444651
+dias_desde_evento_anterior,0.07581385091200196
+maintenance_complexity_score,0.07137987360531821
+event_count_7d,0.06103912707135521
+system_recurrence_30d,0.04917320460265813
+event_count_30d,0.04869136962639425
+preventivo_ratio_30d,0.02224829723910633
+causa_grouped_OTROS,0.005532044917022153
+causa_grouped_CORRECTIVO,0.005298924126401947
+causa_grouped_PREVENTIVO,0.0032924332994892377
+system_diversity_30d,0.0009352895506214791
+sistema_grouped_OTROS,0.0
