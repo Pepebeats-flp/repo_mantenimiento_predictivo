@@ -9,6 +9,30 @@ from typing import Any
 import pandas as pd
 
 DEFAULT_WINDOWS = (7, 5, 3)
+EXCLUDED_FEATURE_COLUMNS = {
+    "placa_patente", "fecha_evento", "empresa_id", "tipo_evento",
+    "severity",
+    "causa_origen", "causa_origen_grouped", "causa_origen_norm",
+    "sistema_componente", "sistema_componente_grouped", "sistema_componente_norm",
+    "taller_planta", "taller_planta_grouped", "taller_planta_norm",
+    "pauta_ejecutada_grouped", "pauta_ejecutada_norm",
+    "pauta_modelo_grouped", "pauta_modelo_norm",
+    "pauta_programa_grouped", "pauta_programa_norm",
+    "unidad_negocio_norm", "user_name_norm",
+    "repuestos_codigo_texto_evento", "repuestos_descripcion_texto_evento_clean",
+}
+
+
+def get_feature_columns(df: pd.DataFrame) -> list[str]:
+    target_cols = {c for c in df.columns if c.startswith("correctivo_prox_")}
+    return [
+        c for c in df.columns
+        if c not in EXCLUDED_FEATURE_COLUMNS
+        and c not in target_cols
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+
 DEFAULT_FEATURE_COLUMNS = [
     "dias_desde_correctivo_anterior",
     "correctivos_previos",
@@ -27,17 +51,29 @@ DEFAULT_FEATURE_COLUMNS = [
 
 
 def _add_bus_statistics(df: pd.DataFrame) -> pd.DataFrame:
-    """Replicate the bus-level statistics used by the original notebook."""
+    """Compute expanding (past-only) bus-level statistics to avoid leakage."""
 
-    bus_stats = df.groupby("placa_patente").agg(
-        {
-            "dias_desde_correctivo_anterior": ["mean", "std", "min", "max"],
-            "correctivos_previos": ["max"],
-        }
+    result = df.copy()
+    result = result.sort_values(["placa_patente", "fecha_evento"])
+
+    stats = (
+        result.groupby("placa_patente")["dias_desde_correctivo_anterior"]
+        .expanding()
+        .agg(["mean", "std", "min", "max"])
+        .reset_index(level=0, drop=True)
     )
-    bus_stats.columns = ["_".join(column) for column in bus_stats.columns]
+    stats.columns = [f"dias_desde_correctivo_anterior_{c}" for c in stats.columns]
 
-    return df.merge(bus_stats, left_on="placa_patente", right_index=True, how="left")
+    max_previos = (
+        result.groupby("placa_patente")["correctivos_previos"]
+        .expanding()
+        .max()
+        .reset_index(level=0, drop=True)
+    )
+    stats["correctivos_previos_max"] = max_previos
+
+    result = pd.concat([result, stats], axis=1)
+    return result
 
 
 def _prepare_event_dataframe(eventos_df: pd.DataFrame) -> pd.DataFrame:
