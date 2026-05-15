@@ -4,6 +4,8 @@ scikit-learn
 xgboost
 imbalanced-learn
 matplotlib
+plotly
+streamlit
 pyarrow
 firebase-admin
 
