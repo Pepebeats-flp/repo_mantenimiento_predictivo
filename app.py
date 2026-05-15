@@ -83,8 +83,33 @@ def get_failure_events():
     base = load_base()
     base = base.copy()
     base["fecha_evento"] = pd.to_datetime(base["fecha_evento"])
-    from src.preprocessing import is_failure_event
-    base["es_falla"] = base.apply(is_failure_event, axis=1)
+
+    tipo = base.get("tipo_servicio", base.get("tipo_revision", "")).fillna("").astype(str).str.upper()
+
+    # CORRECTIVO: causa in SIGNIFICANT_FAILURE_CATEGORIES
+    from src.preprocessing import SIGNIFICANT_FAILURE_CATEGORIES
+    causa = base.get("causa_sistema_reconstruida", "").fillna("").astype(str).str.upper()
+    es_correctivo = tipo == "CORRECTIVO"
+    es_falla_correctivo = es_correctivo & causa.isin(SIGNIFICANT_FAILURE_CATEGORIES)
+
+    # PREVENTIVO: resultado is False/0
+    es_preventivo = tipo == "PREVENTIVO"
+    res = base.get("resultado")
+    if res is not None:
+        if res.dtype == bool:
+            es_falla_preventivo = es_preventivo & ~res
+        else:
+            es_falla_preventivo = es_preventivo & (res.fillna(1).astype(int) == 0)
+    else:
+        es_falla_preventivo = pd.Series(False, index=base.index)
+
+    # REGB / IT: resultado_pasa == 0 OR inspeccion_total_highs > 0
+    es_regb_it = tipo.isin(["REGB", "IT"])
+    resultado_pasa = base.get("resultado_pasa", pd.Series(1, index=base.index)).fillna(1).astype(int)
+    has_highs = base.get("inspeccion_total_highs", pd.Series(0, index=base.index)).fillna(0).astype(int) > 0
+    es_falla_regb_it = es_regb_it & ((resultado_pasa == 0) | has_highs)
+
+    base["es_falla"] = es_falla_correctivo | es_falla_preventivo | es_falla_regb_it
     return base[base["es_falla"]].copy()
 
 
