@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from sklearn.metrics import (
     auc,
     brier_score_loss,
@@ -75,13 +76,31 @@ def evaluate_model(
 
     for threshold in thresholds:
         y_pred = (y_score >= threshold).astype(int)
-        cm = confusion_matrix(y_true, y_pred).tolist()
+        cm_raw = confusion_matrix(y_true, y_pred)
         r = classification_report(y_true, y_pred, zero_division=0, output_dict=True)
-        tn, fp, fn, tp = cm[0][0], cm[0][1], cm[1][0], cm[1][1]
+
+        # Handle 1-class confusion matrices (all true negatives or all positives)
+        if cm_raw.shape == (1, 1):
+            tn = int(cm_raw[0, 0])
+            fp = fn = tp = 0
+        elif cm_raw.shape == (1, 2):
+            tn = int(cm_raw[0, 0])
+            fp = int(cm_raw[0, 1])
+            fn = tp = 0
+        elif cm_raw.shape == (2, 1):
+            tn = int(cm_raw[0, 0])
+            fn = int(cm_raw[1, 0])
+            fp = tp = 0
+        else:
+            tn = int(cm_raw[0, 0])
+            fp = int(cm_raw[0, 1])
+            fn = int(cm_raw[1, 0])
+            tp = int(cm_raw[1, 1])
+
         tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
         metrics["threshold_metrics"][str(threshold)] = {
             "classification_report": r,
-            "confusion_matrix": cm,
+            "confusion_matrix": cm_raw.tolist(),
             "specificity": round(tnr, 4),
             "accuracy": round((tp + tn) / (tp + tn + fp + fn), 4),
         }
@@ -151,4 +170,125 @@ def save_metrics(metrics: dict[str, Any], output_path: str | Path) -> None:
         json.dumps(metrics, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def shadow_evaluate(
+    predictions: pd.DataFrame,
+    eventos_df: pd.DataFrame,
+    buses_piloto: list[str] | None = None,
+    thresholds: Iterable[float] = (0.3, 0.4, 0.5, 0.6, 0.7),
+    exclude_low_severity: bool = True,
+) -> dict[str, Any]:
+    """Evalúa predicciones vs eventos reales para Shadow Mode.
+
+    Para cada predicción (bus, fecha, horizonte H), determina si hubo
+    un evento correctivo real en los H días posteriores usando la misma
+    lógica shift(-1) del entrenamiento.
+
+    Args:
+        predictions: DataFrame con columnas placa_patente, fecha_evento,
+                     horizon_days, probability, alert, severity
+        eventos_df: DataFrame con eventos correctivos (placa_patente, fecha_evento)
+        buses_piloto: Lista de buses a reportar individualmente (None = todos)
+        thresholds: Lista de thresholds a evaluar
+        exclude_low_severity: Si True, excluye eventos LOW de la evaluación
+
+    Returns:
+        Dict con métricas por horizonte y por bus
+    """
+    preds = predictions.copy()
+    preds["fecha_evento"] = pd.to_datetime(preds["fecha_evento"])
+
+    eventos = eventos_df.copy()
+    eventos["fecha_evento"] = pd.to_datetime(eventos["fecha_evento"])
+
+    if exclude_low_severity and "severity" in preds.columns:
+        preds = preds[preds["severity"] != "LOW"].copy()
+
+    resultados: dict[str, Any] = {
+        "config": {
+            "exclude_low_severity": exclude_low_severity,
+            "buses_piloto": buses_piloto or [],
+            "thresholds_evaluados": list(thresholds),
+        },
+        "por_horizonte": {},
+        "por_bus": {},
+    }
+
+    ventanas = sorted(preds["horizon_days"].unique())
+
+    for ventana in ventanas:
+        sub_preds = preds[preds["horizon_days"] == ventana].copy()
+        if sub_preds.empty:
+            continue
+
+        sub_preds = sub_preds.sort_values(["placa_patente", "fecha_evento"])
+
+        next_event = (
+            eventos.sort_values(["placa_patente", "fecha_evento"])
+            .groupby("placa_patente")["fecha_evento"]
+            .shift(-1)
+        )
+        eventos_next = eventos[["placa_patente", "fecha_evento"]].copy()
+        eventos_next["prox_evento"] = next_event
+
+        sub_preds = sub_preds.merge(
+            eventos_next[["placa_patente", "fecha_evento", "prox_evento"]],
+            on=["placa_patente", "fecha_evento"],
+            how="left",
+        )
+
+        delta = (sub_preds["prox_evento"] - sub_preds["fecha_evento"]).dt.days
+        y_true = delta.notna() & delta.le(ventana)
+        y_true = y_true.astype(int).values
+
+        y_score = sub_preds["probability"].values
+
+        metrics = evaluate_model(y_true, y_score, thresholds=thresholds)
+        metrics["total_predicciones"] = len(sub_preds)
+        metrics["total_positivos_reales"] = int(y_true.sum())
+        metrics["tasa_positivos_reales"] = round(float(y_true.mean()), 4)
+        resultados["por_horizonte"][str(ventana)] = metrics
+
+        if buses_piloto:
+            resultados["por_bus"][str(ventana)] = {}
+            for bus in buses_piloto:
+                bus_preds = sub_preds[sub_preds["placa_patente"] == bus]
+                if bus_preds.empty:
+                    continue
+
+                bus_delta = (
+                    (bus_preds["prox_evento"] - bus_preds["fecha_evento"]).dt.days
+                )
+                bus_y_true = bus_delta.notna() & bus_delta.le(ventana)
+                bus_y_true = bus_y_true.astype(int).values
+                bus_y_score = bus_preds["probability"].values
+
+                if len(bus_y_true) < 5:
+                    resultados["por_bus"][str(ventana)][bus] = {
+                        "error": "insufficient_data",
+                        "total": int(len(bus_y_true)),
+                    }
+                    continue
+
+                # Skip if only one class present (can't compute meaningful metrics)
+                n_pos = int(bus_y_true.sum())
+                n_neg = len(bus_y_true) - n_pos
+                if n_pos == 0 or n_neg == 0:
+                    resultados["por_bus"][str(ventana)][bus] = {
+                        "error": "single_class",
+                        "total": int(len(bus_y_true)),
+                        "n_pos": n_pos,
+                        "n_neg": n_neg,
+                    }
+                    continue
+
+                bus_metrics = evaluate_model(
+                    bus_y_true, bus_y_score, thresholds=thresholds
+                )
+                bus_metrics["total_predicciones"] = len(bus_preds)
+                bus_metrics["total_positivos_reales"] = int(bus_y_true.sum())
+                resultados["por_bus"][str(ventana)][bus] = bus_metrics
+
+    return resultados
 

@@ -6,12 +6,13 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 DEFAULT_WINDOWS = (7, 5, 3)
 EXCLUDED_FEATURE_COLUMNS = {
-    "placa_patente", "fecha_evento", "empresa_id", "tipo_evento",
-    "severity",
+    "placa_patente", "fecha_evento", "fecha_dia", "empresa_id", "tipo_evento",
+    "tipo_servicio", "tipo_revision", "es_falla", "severity",
     "causa_origen", "causa_origen_grouped", "causa_origen_norm",
     "sistema_componente", "sistema_componente_grouped", "sistema_componente_norm",
     "taller_planta", "taller_planta_grouped", "taller_planta_norm",
@@ -19,12 +20,23 @@ EXCLUDED_FEATURE_COLUMNS = {
     "pauta_modelo_grouped", "pauta_modelo_norm",
     "pauta_programa_grouped", "pauta_programa_norm",
     "unidad_negocio_norm", "user_name_norm",
+    "unidad_servicio_norm", "unidad_servicio",
+    "lugar_inspeccion_norm", "lugar_inspeccion",
+    "representante_op_norm", "representante_op",
+    "obs_inspeccion_norm", "obs_inspeccion",
     "repuestos_codigo_texto_evento", "repuestos_descripcion_texto_evento_clean",
+    "inspeccion_total_highs", "inspeccion_total_mediums", "inspeccion_total_lows",
+    "inspeccion_curr_highs", "inspeccion_curr_mediums", "inspeccion_curr_lows",
+    "resultado_pasa",
+    "group_texto", "sistemas_inspeccionados_texto",
+    "repuestos_descripcion_texto_clean", "repuestos_descripcion_texto",
+    "repuestos_codigo_texto", "repuestos_marca_texto", "repuestos_tipo_texto",
+    "uuid_gestion_texto", "insumos_texto",
 }
 
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    target_cols = {c for c in df.columns if c.startswith("correctivo_prox_")}
+    target_cols = {c for c in df.columns if c.startswith("correctivo_prox_") or c.startswith("evento_falla_prox_")}
     return [
         c for c in df.columns
         if c not in EXCLUDED_FEATURE_COLUMNS
@@ -34,8 +46,13 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
 
 
 DEFAULT_FEATURE_COLUMNS = [
+    "dias_desde_evento_anterior",
     "dias_desde_correctivo_anterior",
+    "eventos_previos",
     "correctivos_previos",
+    "eventos_ult_7d",
+    "eventos_ult_5d",
+    "eventos_ult_3d",
     "correctivos_ult_7d",
     "correctivos_ult_5d",
     "correctivos_ult_3d",
@@ -56,8 +73,12 @@ def _add_bus_statistics(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     result = result.sort_values(["placa_patente", "fecha_evento"])
 
+    gap_col = "dias_desde_evento_anterior"
+    if gap_col not in result.columns:
+        gap_col = "dias_desde_correctivo_anterior"
+
     stats = (
-        result.groupby("placa_patente")["dias_desde_correctivo_anterior"]
+        result.groupby("placa_patente")[gap_col]
         .expanding()
         .agg(["mean", "std", "min", "max"])
         .reset_index(level=0, drop=True)
@@ -65,7 +86,7 @@ def _add_bus_statistics(df: pd.DataFrame) -> pd.DataFrame:
     stats.columns = [f"dias_desde_correctivo_anterior_{c}" for c in stats.columns]
 
     max_previos = (
-        result.groupby("placa_patente")["correctivos_previos"]
+        result.groupby("placa_patente")["eventos_previos"]
         .expanding()
         .max()
         .reset_index(level=0, drop=True)
@@ -228,32 +249,84 @@ def _add_category_window_counts(
     return df
 
 
+def generate_bus_history_features(
+    eventos_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Create bus-level historical features: lifetime corrective count, historical failure rate."""
+
+    features_df = _prepare_event_dataframe(eventos_df)
+
+    total_eventos = features_df.groupby("placa_patente").cumcount() + 1
+    total_correctivos = features_df.groupby("placa_patente")["filas_correctivo_evento"].cumsum() if "filas_correctivo_evento" in features_df.columns else total_eventos
+    features_df["total_eventos_hist"] = total_eventos
+    features_df["total_correctivos_hist"] = total_correctivos
+    features_df["tasa_correctivos_hist"] = (total_correctivos / total_eventos).fillna(0).clip(0, 1)
+
+    if "es_falla" in features_df.columns:
+        total_fallas = features_df.groupby("placa_patente")["es_falla"].cumsum()
+        features_df["total_fallas_hist"] = total_fallas
+        features_df["tasa_fallas_hist"] = (total_fallas / total_eventos).fillna(0).clip(0, 1)
+
+    return features_df
+
+
 def generate_rolling_features(
     eventos_df: pd.DataFrame,
     windows: Iterable[int] = DEFAULT_WINDOWS,
 ) -> pd.DataFrame:
-    """Generate baseline history, rolling windows and bus-level statistics."""
+    """Generate baseline history, rolling windows and bus-level statistics.
+
+    Works across ALL event types. ``dias_desde_evento_anterior`` is
+    pre-computed in ``create_eventos_dataframe``.
+    """
 
     features_df = _prepare_event_dataframe(eventos_df)
 
-    features_df["dias_desde_correctivo_anterior"] = (
-        features_df.groupby("placa_patente")["fecha_evento"]
-        .diff()
-        .dt.total_seconds()
-        .div(60 * 60 * 24)
-    )
-    features_df["correctivos_previos"] = features_df.groupby("placa_patente").cumcount()
+    if "dias_desde_evento_anterior" not in features_df.columns:
+        features_df["dias_desde_evento_anterior"] = (
+            features_df.groupby("placa_patente")["fecha_evento"]
+            .diff()
+            .dt.total_seconds()
+            .div(60 * 60 * 24)
+        )
+    # Keep backward compat alias
+    features_df["dias_desde_correctivo_anterior"] = features_df["dias_desde_evento_anterior"]
+
+    features_df["eventos_previos"] = features_df.groupby("placa_patente").cumcount()
+    features_df["correctivos_previos"] = features_df["eventos_previos"]
 
     rolling_df = features_df.set_index("fecha_evento")
     for window in windows:
-        rolling_df[f"correctivos_ult_{window}d"] = (
+        rolling_df[f"eventos_ult_{window}d"] = (
             rolling_df.groupby("placa_patente")["placa_patente"]
             .rolling(f"{window}D")
             .count()
             .reset_index(level=0, drop=True)
         )
+        rolling_df[f"correctivos_ult_{window}d"] = rolling_df[f"eventos_ult_{window}d"]
+
+        # Failure rate in window (corrective / total)
+        if "es_falla" in rolling_df.columns:
+            fail_count = (
+                rolling_df.groupby("placa_patente")["es_falla"]
+                .rolling(f"{window}D")
+                .sum()
+                .reset_index(level=0, drop=True)
+            )
+            total_count = rolling_df[f"eventos_ult_{window}d"]
+            rolling_df[f"tasa_falla_ult_{window}d"] = (
+                (fail_count / total_count).fillna(0).clip(0, 1)
+            )
+
     features_df = rolling_df.reset_index()
 
+    # Days since last failure
+    if "es_falla" in features_df.columns:
+        features_df = _days_since_last_true_event(
+            features_df, "es_falla", "dias_desde_ultima_falla"
+        )
+
+    # Update bus statistics to use the new column name
     features_df = _add_bus_statistics(features_df)
     return features_df
 
@@ -442,6 +515,99 @@ def generate_text_pattern_features(
     return features_df
 
 
+def generate_event_type_features(
+    eventos_df: pd.DataFrame,
+    short_windows: Iterable[int] = (7, 30),
+    long_windows: Iterable[int] = (60, 180),
+) -> pd.DataFrame:
+    """Create rolling counts and recency features per event type (CORRECTIVO, PREV, REGB, IT)."""
+
+    features_df = _prepare_event_dataframe(eventos_df)
+
+    tipo_col = "tipo_servicio"
+    if tipo_col not in features_df.columns:
+        return features_df
+
+    tipos_presentes = features_df[tipo_col].dropna().unique()
+    all_windows = sorted(set(list(short_windows) + list(long_windows)))
+
+    for tipo in tipos_presentes:
+        safe_tipo = _sanitize_feature_name(tipo)
+        flag_col = f"__flag_{safe_tipo}"
+        features_df[flag_col] = (features_df[tipo_col] == tipo).astype(int)
+
+        for w in all_windows:
+            features_df = _rolling_sum_by_bus(
+                features_df,
+                flag_col,
+                f"count_{safe_tipo}_ult_{w}d",
+                window_days=w,
+            )
+
+        # Days since last event of this type
+        features_df = _days_since_last_true_event(
+            features_df,
+            flag_col,
+            f"dias_desde_ultimo_{safe_tipo}",
+        )
+
+        features_df = features_df.drop(columns=[flag_col])
+
+    return features_df
+
+
+def generate_severity_features(
+    eventos_df: pd.DataFrame,
+    short_windows: Iterable[int] = (30,),
+    long_windows: Iterable[int] = (90, 180),
+) -> pd.DataFrame:
+    """Create rolling severity sum features from REGB/IT inspections."""
+
+    features_df = _prepare_event_dataframe(eventos_df)
+
+    tipo_col = "tipo_servicio"
+    severity_cols = [
+        ("inspeccion_total_highs_evento", "highs"),
+        ("inspeccion_total_mediums_evento", "mediums"),
+        ("inspeccion_total_lows_evento", "lows"),
+    ]
+
+    for sev_col, sev_name in severity_cols:
+        if sev_col not in features_df.columns:
+            continue
+
+        for tipo in ("REGB", "IT"):
+            safe_tipo = _sanitize_feature_name(tipo)
+            tipo_flag = (features_df.get(tipo_col) == tipo).astype(int)
+            val_col = f"__sev_{safe_tipo}_{sev_name}"
+            features_df[val_col] = (
+                pd.to_numeric(features_df.get(sev_col, 0), errors="coerce").fillna(0) * tipo_flag
+            )
+
+            windows = long_windows if tipo == "IT" else short_windows
+            for w in windows:
+                features_df = _rolling_sum_by_bus(
+                    features_df,
+                    val_col,
+                    f"{sev_name}_{safe_tipo}_ult_{w}d",
+                    window_days=w,
+                )
+
+            features_df = features_df.drop(columns=[val_col])
+
+    # Flag: no presentado
+    if "flag_no_presentado" in features_df.columns:
+        features_df["no_presentado_ult_30d"] = _rolling_sum_by_bus(
+            features_df,
+            "flag_no_presentado",
+            "_no_presentado_30d_temp",
+            window_days=30,
+        )["_no_presentado_30d_temp"]
+        features_df = features_df.drop(columns=["_no_presentado_30d_temp"])
+
+    return features_df
+
+
 def create_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add simple temporal variables derived from ``fecha_evento``."""
 
@@ -458,21 +624,52 @@ def create_future_targets(
     df: pd.DataFrame,
     windows: Iterable[int] = DEFAULT_WINDOWS,
 ) -> pd.DataFrame:
-    """Create binary future-corrective targets using the original logic."""
+    """Create binary future-failure targets.
+
+    For each event, the target is 1 if the next **failure** event
+    (``es_falla == True``) occurs within ``window`` days.
+    Non-failure events still contribute features but their target is
+    based on the next failure event after them.
+    """
 
     target_df = df.copy()
     target_df["fecha_evento"] = pd.to_datetime(target_df["fecha_evento"], errors="coerce")
     target_df = target_df.sort_values(["placa_patente", "fecha_evento"], kind="stable").copy()
 
-    next_delta_days = (
-        target_df.groupby("placa_patente")["fecha_evento"]
+    if "es_falla" not in target_df.columns:
+        target_df["es_falla"] = True  # fallback for backward compat
+
+    # Get the next failure event date per bus
+    fallas = target_df[target_df["es_falla"]].copy()
+    fallas["prox_falla_fecha"] = (
+        fallas.groupby("placa_patente")["fecha_evento"]
         .shift(-1)
+    )
+
+    # Merge next failure date back to all events
+    fallas_map = fallas[["placa_patente", "fecha_evento", "prox_falla_fecha"]].copy()
+    target_df = target_df.merge(
+        fallas_map,
+        on=["placa_patente", "fecha_evento"],
+        how="left",
+    )
+
+    # Forward-fill: for events after a failure, use the same next-failure date
+    target_df["prox_falla_fecha"] = target_df.groupby("placa_patente")["prox_falla_fecha"].bfill()
+
+    next_delta_days = (
+        target_df["prox_falla_fecha"]
         .sub(target_df["fecha_evento"])
         .dt.days
     )
 
     for window in windows:
-        target_df[f"correctivo_prox_{window}d"] = next_delta_days.le(window).fillna(False)
+        col_name = f"correctivo_prox_{window}d"
+        target_df[col_name] = next_delta_days.le(window).fillna(False)
+
+    target_df = target_df.drop(columns=["prox_falla_fecha"])
+    target_df = target_df.drop(columns=["prox_falla_fecha_y"], errors="ignore")
+    target_df = target_df.drop(columns=["prox_falla_fecha_x"], errors="ignore")
 
     return target_df
 
@@ -493,14 +690,14 @@ def summarize_feature_quality(
             else 0,
         },
         {
-            "check": "negative_dias_desde_correctivo_anterior",
+            "check": "negative_dias_desde_evento_anterior",
             "value": int(
-                pd.to_numeric(df.get("dias_desde_correctivo_anterior"), errors="coerce")
+                pd.to_numeric(df.get("dias_desde_evento_anterior"), errors="coerce")
                 .lt(0)
                 .fillna(False)
                 .sum()
             )
-            if "dias_desde_correctivo_anterior" in df.columns
+            if "dias_desde_evento_anterior" in df.columns
             else 0,
         },
     ]
@@ -516,3 +713,69 @@ def summarize_feature_quality(
             )
 
     return pd.DataFrame(summary_rows)
+
+
+def generate_trend_features(
+    eventos_df: pd.DataFrame,
+    windows: Iterable[int] = (7, 30, 60),
+) -> pd.DataFrame:
+    """Create trend features: slope of rolling event/failure counts over time."""
+    features_df = _prepare_event_dataframe(eventos_df)
+    features_df = features_df.sort_values(["placa_patente", "fecha_evento"])
+
+    for window in windows:
+        col_events = f"eventos_ult_{window}d"
+        col_fallas = f"tasa_falla_ult_{window}d"
+        trend_events = f"trend_eventos_{window}d"
+        trend_fallas = f"trend_fallas_{window}d"
+
+        if col_events not in features_df.columns:
+            features_df[col_events] = 0
+        if col_fallas not in features_df.columns:
+            features_df[col_fallas] = 0.0
+
+        def _slope(series: pd.Series) -> float:
+            x = np.arange(len(series))
+            y = series.values.astype(float)
+            if len(y) < 2 or np.all(y == y[0]):
+                return 0.0
+            return float(np.polyfit(x, y, 1)[0])
+
+        features_df[trend_events] = (
+            features_df.groupby("placa_patente")[col_events]
+            .expanding()
+            .apply(_slope, raw=False)
+            .reset_index(level=0, drop=True)
+        )
+        features_df[trend_fallas] = (
+            features_df.groupby("placa_patente")[col_fallas]
+            .expanding()
+            .apply(_slope, raw=False)
+            .reset_index(level=0, drop=True)
+        )
+
+    return features_df
+
+
+def generate_bus_age_features(
+    eventos_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Create bus age / life-cycle features from the event history."""
+    features_df = _prepare_event_dataframe(eventos_df)
+
+    bus_first_event = features_df.groupby("placa_patente")["fecha_evento"].transform("min")
+    features_df["edad_bus_dias"] = (
+        features_df["fecha_evento"] - bus_first_event
+    ).dt.total_seconds().div(86400).fillna(0)
+
+    features_df["total_eventos_vida"] = features_df.groupby("placa_patente").cumcount() + 1
+
+    preventivo_flag = (
+        features_df["tipo_servicio"].str.upper().eq("PREVENTIVO")
+    ).astype(int) if "tipo_servicio" in features_df.columns else pd.Series(0, index=features_df.index)
+    features_df["tiene_preventivo"] = preventivo_flag
+    features_df = _days_since_last_true_event(
+        features_df, "tiene_preventivo", "dias_desde_ultimo_preventivo"
+    )
+
+    return features_df

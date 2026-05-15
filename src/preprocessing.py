@@ -27,7 +27,11 @@ DEFAULT_CATEGORY_TOP_K = {
     "pauta_ejecutada": 10,
     "pauta_proyectada": 10,
     "unidad_negocio": 5,
+    "unidad_servicio": 5,
     "user_name": 10,
+    "lugar_inspeccion": 8,
+    "obs_inspeccion": 5,
+    "representante_op": 5,
 }
 KEYWORD_PATTERNS = {
     "keyword_motor": ("MOTOR",),
@@ -57,8 +61,11 @@ CAUSA_SISTEMA_REGEX = {
         r"\bBUJE[S]?\b"
     ],
 
-    "CARROCERIA": [
+    "PUERTAS": [
         r"\bPUERTA[S]?\b",
+    ],
+
+    "CARROCERIA": [
         r"\bVIDRIO[S]?\b",
         r"\bPARACHOQUE[S]?\b"
     ],
@@ -289,6 +296,10 @@ def clean_textual_fields(df: pd.DataFrame) -> pd.DataFrame:
         "sistema_componente",
         "taller_planta",
         "user_name",
+        "obs_inspeccion",
+        "lugar_inspeccion",
+        "unidad_servicio",
+        "representante_op",
     ]
 
     for column in text_columns:
@@ -361,7 +372,21 @@ def _add_keyword_indicators(df: pd.DataFrame, source_column: str) -> pd.DataFram
 def extract_additional_fields(df: pd.DataFrame) -> pd.DataFrame:
     """Extend the cleaned base with nested JSON summaries and normalized columns."""
 
-    enriched_df = flatten_nested_json_fields(df)
+    enriched_df = df.copy()
+
+    # Map inspection place → taller_planta for REGB/IT
+    if "lugar_inspeccion" in enriched_df.columns and "taller_planta" not in enriched_df.columns:
+        enriched_df["taller_planta"] = enriched_df["lugar_inspeccion"]
+    elif "lugar_inspeccion" in enriched_df.columns and "taller_planta" in enriched_df.columns:
+        enriched_df["taller_planta"] = enriched_df["taller_planta"].fillna(enriched_df["lugar_inspeccion"])
+
+    # Map inspection obs → observacion
+    if "obs_inspeccion" in enriched_df.columns and "observacion" not in enriched_df.columns:
+        enriched_df["observacion"] = enriched_df["obs_inspeccion"]
+    elif "obs_inspeccion" in enriched_df.columns and "observacion" in enriched_df.columns:
+        enriched_df["observacion"] = enriched_df["observacion"].fillna(enriched_df["obs_inspeccion"])
+
+    enriched_df = flatten_nested_json_fields(enriched_df)
 
     timestamp_columns = [
         "fecha_creacion_timestamp",
@@ -500,12 +525,57 @@ def summarize_data_quality(
     return pd.DataFrame(quality_rows)
 
 
+SIGNIFICANT_FAILURE_CATEGORIES = frozenset({
+    "FRENOS", "MOTOR", "ELECTRICO", "CLIMATIZACION", "RUEDAS", "SUSPENSION", "PUERTAS",
+})
+
+FAILURE_TIPO_MAP: dict[str, str] = {
+    "CORRECTIVO": "always",
+    "PREVENTIVO": "resultado_bool",
+    "REGB": "highs_gt_0",
+    "IT": "highs_gt_0",
+}
+
+
+def is_failure_event(row: pd.Series | dict[str, Any]) -> bool:
+    """Determine if a record represents a failure event based on its tipo.
+
+    - CORRECTIVO: a failure only if ``causa_sistema_reconstruida`` is in
+      ``SIGNIFICANT_FAILURE_CATEGORIES`` (FRENOS, MOTOR, ELECTRICO,
+      CLIMATIZACION, RUEDAS, SUSPENSION, PUERTAS).
+    - PREVENTIVO: failure if ``resultado`` is False/0 (rechazado)
+    - REGB / IT: failure if ``resultado_pasa == 0`` (rechazado) OR
+      ``inspeccion_total_highs > 0`` (defectos criticos)
+    """
+    tipo = str(row.get("tipo_servicio", row.get("tipo_revision", ""))).upper()
+    if tipo == "CORRECTIVO":
+        causa = str(row.get("causa_sistema_reconstruida", "")).upper()
+        return causa in SIGNIFICANT_FAILURE_CATEGORIES
+    if tipo == "PREVENTIVO":
+        res = row.get("resultado")
+        if isinstance(res, bool):
+            return not res
+        if isinstance(res, (int, float)):
+            return bool(res) is False or res == 0
+        return False
+    if tipo in ("REGB", "IT"):
+        resultado_pasa = row.get("resultado_pasa", 1)
+        if resultado_pasa is None:
+            resultado_pasa = 1
+        resultado_pasa = int(resultado_pasa)
+        has_highs = int(row.get("inspeccion_total_highs", 0) or 0) > 0
+        return resultado_pasa == 0 or has_highs
+    return False
+
+
 def clean_data(
     preventivo_raw: Iterable[Any],
     correctivo_raw: Iterable[Any],
+    regb_df: pd.DataFrame | None = None,
+    it_df: pd.DataFrame | None = None,
     empresa_id: str = DEFAULT_EMPRESA_ID,
 ) -> pd.DataFrame:
-    """Normalize both JSON sources and create the shared ``fecha_evento`` field."""
+    """Normalize all data sources and create the shared ``fecha_evento`` field."""
 
     preventivo_filtered = _filter_deleted(preventivo_raw)
     correctivo_filtered = _filter_deleted(correctivo_raw)
@@ -518,21 +588,36 @@ def clean_data(
     if df_correctivo.empty:
         df_correctivo = pd.DataFrame(columns=["firebase_id"])
 
-    df_preventivo["tipo_revision"] = "PREVENTIVO"
-    df_correctivo["tipo_revision"] = "CORRECTIVO"
+    df_preventivo["tipo_servicio"] = "PREVENTIVO"
+    df_correctivo["tipo_servicio"] = "CORRECTIVO"
     df_preventivo["empresa_id"] = empresa_id
     df_correctivo["empresa_id"] = empresa_id
 
-    df = pd.concat([df_preventivo, df_correctivo], ignore_index=True, sort=False)
+    frames = [df_preventivo, df_correctivo]
 
+    if regb_df is not None and not regb_df.empty:
+        regb_df = regb_df.copy()
+        regb_df["empresa_id"] = empresa_id
+        frames.append(regb_df)
+
+    if it_df is not None and not it_df.empty:
+        it_df = it_df.copy()
+        it_df["empresa_id"] = empresa_id
+        frames.append(it_df)
+
+    df = pd.concat(frames, ignore_index=True, sort=False)
+
+    # Set fecha_evento from ot_apertura_timestamp for CORR/PREV
+    mask_std = df["tipo_servicio"].isin(["CORRECTIVO", "PREVENTIVO"])
     if "ot_apertura_timestamp" in df.columns:
-        df["fecha_evento"] = pd.to_datetime(
-            df["ot_apertura_timestamp"],
+        df.loc[mask_std, "fecha_evento"] = pd.to_datetime(
+            df.loc[mask_std, "ot_apertura_timestamp"],
             unit="s",
             errors="coerce",
         )
-    else:
-        df["fecha_evento"] = pd.NaT
+
+    # Also ensure tipo_revision exists for backward compatibility
+    df["tipo_revision"] = df["tipo_servicio"]
 
     return df
 
@@ -562,27 +647,52 @@ def create_base_dataframe(
 
 
 def create_eventos_dataframe(base_df: pd.DataFrame) -> pd.DataFrame:
-    """Group corrective orders by bus and day into unique technical events."""
+    """Create technical events from ALL tipos, keeping separate events per day.
 
-    correctivos = base_df.loc[base_df["tipo_revision"].eq("CORRECTIVO")].copy()
+    Each (bus, day, tipo_servicio) combination becomes its own event.
+    Also computes ``dias_desde_evento_anterior`` and marks ``es_falla``.
+    """
 
-    required_columns = ["placa_patente", "fecha_evento", *EVENT_AGGREGATIONS.keys()]
+    eventos = base_df.copy()
+
+    required_columns = ["placa_patente", "fecha_evento"]
     for column in required_columns:
-        if column not in correctivos.columns:
-            correctivos[column] = pd.NA
+        if column not in eventos.columns:
+            eventos[column] = pd.NA
 
-    correctivos["fecha_evento"] = pd.to_datetime(correctivos["fecha_evento"], errors="coerce")
-    correctivos = correctivos.dropna(subset=["placa_patente", "fecha_evento"]).copy()
-    correctivos["fecha_dia"] = correctivos["fecha_evento"].dt.date
+    eventos["fecha_evento"] = pd.to_datetime(eventos["fecha_evento"], errors="coerce")
+    eventos = eventos.dropna(subset=["placa_patente", "fecha_evento"]).copy()
+    eventos["fecha_dia"] = eventos["fecha_evento"].dt.date
+
+    # Keep per-tipo rows separate (same bus/day/tipo → aggregate)
+    eventos["es_falla"] = eventos.apply(is_failure_event, axis=1)
+
+    # Build aggregations dynamically (only for columns that exist)
+    EVENT_AGGREGATIONS_ALL = dict(EVENT_AGGREGATIONS)
+    EVENT_AGGREGATIONS_ALL["tipo_servicio"] = "first"
+    EVENT_AGGREGATIONS_ALL["es_falla"] = "max"
+    for col in ["resultado_pasa"]:
+        if col in eventos.columns:
+            EVENT_AGGREGATIONS_ALL[col] = "max"
 
     eventos_df = (
-        correctivos.groupby(["placa_patente", "fecha_dia"], as_index=False)
-        .agg(EVENT_AGGREGATIONS)
-        .sort_values(["placa_patente", "fecha_evento"], kind="stable")
+        eventos.groupby(["placa_patente", "fecha_dia", "tipo_servicio"], as_index=False)
+        .agg({k: v for k, v in EVENT_AGGREGATIONS_ALL.items() if k in eventos.columns})
+        .sort_values(["placa_patente", "tipo_servicio", "fecha_evento"], kind="stable")
         .reset_index(drop=True)
     )
 
-    eventos_df["dias_desde_correctivo_anterior"] = (
+    # Collapse identical-timestamp duplicates (data artifact: CORR+PREV con misma hora)
+    dups_before = eventos_df.duplicated(subset=["placa_patente", "fecha_evento"], keep=False).sum()
+    before_count = len(eventos_df)
+    eventos_df = eventos_df.drop_duplicates(
+        subset=["placa_patente", "fecha_evento"], keep="first"
+    ).reset_index(drop=True)
+    dup_removed = before_count - len(eventos_df)
+    if dup_removed > 0:
+        print(f"    Colapsadas {dup_removed} filas duplicadas (mismo bus+timestamp) → {len(eventos_df)} filas")
+
+    eventos_df["dias_desde_evento_anterior"] = (
         eventos_df.groupby("placa_patente")["fecha_evento"]
         .diff()
         .dt.total_seconds()
@@ -668,35 +778,85 @@ def _aggregate_event_group(group: pd.DataFrame) -> pd.Series:
     return pd.Series(aggregated)
 
 
+def _aggregate_inspection_group(group: pd.DataFrame) -> pd.Series:
+    """Aggregate REGB/IT specific fields per (bus, day) group."""
+    aggregated: dict[str, Any] = {
+        "inspeccion_total_highs_evento": int(
+            pd.to_numeric(group.get("inspeccion_total_highs", pd.Series(0)), errors="coerce").fillna(0).max()
+        ),
+        "inspeccion_total_mediums_evento": int(
+            pd.to_numeric(group.get("inspeccion_total_mediums", pd.Series(0)), errors="coerce").fillna(0).max()
+        ),
+        "inspeccion_total_lows_evento": int(
+            pd.to_numeric(group.get("inspeccion_total_lows", pd.Series(0)), errors="coerce").fillna(0).max()
+        ),
+    }
+
+    no_presentado = group.get("obs_inspeccion", pd.Series("")).fillna("").astype(str).str.contains(
+        "BUS NO PRESENTADO", case=False, na=False
+    ).any()
+    aggregated["flag_no_presentado"] = int(no_presentado)
+
+    # Count how many grupos (system groups) in IT inspections
+    group_vals = group.get("group", pd.Series(dtype=object))
+    all_groups: list[str] = []
+    for gv in group_vals:
+        if isinstance(gv, list):
+            all_groups.extend(str(x) for x in gv)
+    aggregated["num_sistemas_inspeccionados"] = len(set(all_groups))
+    aggregated["sistemas_inspeccionados_texto"] = " | ".join(sorted(set(all_groups)))
+
+    return pd.Series(aggregated)
+
+
 def merge_additional_event_fields(
     base_df: pd.DataFrame,
     eventos_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Merge additive event-level fields onto the existing eventos dataframe."""
+    """Merge additive event-level fields from all tipos onto eventos."""
 
     enriched_events = eventos_df.copy()
-    correctivos = base_df.loc[base_df["tipo_revision"].eq("CORRECTIVO")].copy()
 
-    if "fecha_evento" not in correctivos.columns or correctivos.empty:
-        return enriched_events
+    # Aggregate CORRECTIVO fields (existing logic)
+    correctivos = base_df.loc[base_df["tipo_servicio"].eq("CORRECTIVO")].copy()
+    if not correctivos.empty and "fecha_evento" in correctivos.columns:
+        correctivos["fecha_evento"] = pd.to_datetime(correctivos["fecha_evento"], errors="coerce")
+        correctivos = correctivos.dropna(subset=["placa_patente", "fecha_evento"]).copy()
+        correctivos["fecha_dia"] = correctivos["fecha_evento"].dt.date
 
-    correctivos["fecha_evento"] = pd.to_datetime(correctivos["fecha_evento"], errors="coerce")
-    correctivos = correctivos.dropna(subset=["placa_patente", "fecha_evento"]).copy()
-    correctivos["fecha_dia"] = correctivos["fecha_evento"].dt.date
+        corr_fields = (
+            correctivos.groupby(["placa_patente", "fecha_dia"])
+            .apply(_aggregate_event_group)
+            .reset_index()
+        )
+        enriched_events["fecha_evento"] = pd.to_datetime(enriched_events["fecha_evento"], errors="coerce")
+        enriched_events["fecha_dia"] = enriched_events["fecha_evento"].dt.date
+        enriched_events = enriched_events.merge(
+            corr_fields,
+            on=["placa_patente", "fecha_dia"],
+            how="left",
+        )
+        enriched_events = enriched_events.drop(columns=["fecha_dia"])
 
-    event_fields = (
-        correctivos.groupby(["placa_patente", "fecha_dia"])
-        .apply(_aggregate_event_group)
-        .reset_index()
-    )
+    # Aggregate REGB/IT fields
+    inspections = base_df[base_df["tipo_servicio"].isin(["REGB", "IT"])].copy()
+    if not inspections.empty and "fecha_evento" in inspections.columns:
+        inspections["fecha_evento"] = pd.to_datetime(inspections["fecha_evento"], errors="coerce")
+        inspections = inspections.dropna(subset=["placa_patente", "fecha_evento"]).copy()
+        inspections["fecha_dia"] = inspections["fecha_evento"].dt.date
 
-    enriched_events["fecha_evento"] = pd.to_datetime(enriched_events["fecha_evento"], errors="coerce")
-    enriched_events["fecha_dia"] = enriched_events["fecha_evento"].dt.date
-    enriched_events = enriched_events.merge(
-        event_fields,
-        on=["placa_patente", "fecha_dia"],
-        how="left",
-    )
-    enriched_events = enriched_events.drop(columns=["fecha_dia"])
+        insp_fields = (
+            inspections.groupby(["placa_patente", "fecha_dia"])
+            .apply(_aggregate_inspection_group)
+            .reset_index()
+        )
+        enriched_events["fecha_evento"] = pd.to_datetime(enriched_events["fecha_evento"], errors="coerce")
+        enriched_events["fecha_dia"] = enriched_events["fecha_evento"].dt.date
+        enriched_events = enriched_events.merge(
+            insp_fields,
+            on=["placa_patente", "fecha_dia"],
+            how="left",
+        )
+        enriched_events = enriched_events.drop(columns=["fecha_dia"])
 
     return enriched_events

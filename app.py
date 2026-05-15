@@ -1,409 +1,561 @@
 #!/usr/bin/env python3
-"""Panel de Gestion Predictiva — Mantenimiento de Flota
+"""Dashboard Piloto 1 — Shadow Mode
 Uso: streamlit run app.py
 """
-
 from __future__ import annotations
 
+import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+HORIZONS = [3, 5, 7]
+DECISION_THRESHOLD = 0.6
 
-# ── Carga de datos ─────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Piloto 1 — Predicción de Fallas",
+    page_icon="🚍",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+OUTCOME_EMOJI = {"TP": "✅", "TN": "⬜", "FP": "🟠", "FN": "🔴"}
+OUTCOME_COLOR = {"TP": "#22c55e", "TN": "#d1d5db", "FP": "#f97316", "FN": "#ef4444"}
+OUTCOME_LABEL = {
+    "TP": "Alerta correcta — se predijo la falla y ocurrió",
+    "TN": "Tranquilidad — no se predijo y no pasó nada",
+    "FP": "Falsa alarma — se predijo pero no ocurrió",
+    "FN": "Falla no detectada — ocurrió sin alerta previa",
+}
+OUTCOME_SYMBOL = {"TP": "circle", "TN": "circle", "FP": "diamond", "FN": "x"}
+OUTCOME_SIZE = {"TP": 10, "TN": 6, "FP": 10, "FN": 12}
+
 
 @st.cache_data
 def load_base():
     return pd.read_parquet(PROJECT_ROOT / "data" / "processed" / "base.parquet")
 
-@st.cache_data
-def load_eventos():
-    return pd.read_parquet(PROJECT_ROOT / "data" / "processed" / "eventos_train.parquet")
 
 @st.cache_data
 def load_predictions():
     p = PROJECT_ROOT / "data" / "predictions" / "predictions_voy_redbus.parquet"
     if p.exists():
         return pd.read_parquet(p)
-    return pd.read_parquet(PROJECT_ROOT / "data" / "predictions" / "predictions.parquet")
+    return pd.DataFrame()
+
 
 @st.cache_data
-def get_empresa_mapping():
-    """Map each placa_patente to su empresa_id (VOY o REDBUS).
+def load_shadow_report():
+    p = PROJECT_ROOT / "outputs" / "piloto1_report.json"
+    if p.exists():
+        with open(p) as f:
+            return json.load(f)
+    return None
 
-    Para buses que aparecen en ambos operadores (solo 1 caso), se usa el mas frecuente.
-    """
+
+@st.cache_data
+def get_failure_events():
     base = load_base()
-    mapping = base.groupby("placa_patente")["empresa_id"].agg(lambda x: x.mode()[0])
-    return mapping
+    base = base.copy()
+    base["fecha_evento"] = pd.to_datetime(base["fecha_evento"])
+    from src.preprocessing import is_failure_event
+    base["es_falla"] = base.apply(is_failure_event, axis=1)
+    return base[base["es_falla"]].copy()
 
 
-st.set_page_config(page_title="Mantenimiento Predictivo — Flota", page_icon="🔧", layout="wide")
+def enrich_predictions(preds: pd.DataFrame, failures: pd.DataFrame, bus: str, horizon: int | None) -> pd.DataFrame:
+    if horizon is not None:
+        sub = preds[
+            (preds["placa_patente"] == bus) & (preds["horizon_days"] == horizon)
+        ].sort_values("fecha_evento").copy()
+        if sub.empty:
+            return pd.DataFrame()
+        sub["fecha_evento"] = pd.to_datetime(sub["fecha_evento"])
+
+        f = failures.sort_values(["placa_patente", "fecha_evento"])
+        next_event = f.groupby("placa_patente")["fecha_evento"].shift(-1)
+        eventos_next = f[["placa_patente", "fecha_evento", "causa_sistema_reconstruida"]].copy()
+        eventos_next["prox_evento"] = next_event
+
+        merged = sub.merge(
+            eventos_next[["placa_patente", "fecha_evento", "prox_evento", "causa_sistema_reconstruida"]],
+            on=["placa_patente", "fecha_evento"],
+            how="left",
+        )
+        delta = (merged["prox_evento"] - merged["fecha_evento"]).dt.days
+        merged["falla_real"] = (delta.notna() & delta.le(horizon)).astype(int)
+        merged["alerta"] = (merged["probability"] >= DECISION_THRESHOLD).astype(int)
+
+        merged["resultado"] = "N/A"
+        merged.loc[(merged["alerta"] == 1) & (merged["falla_real"] == 1), "resultado"] = "TP"
+        merged.loc[(merged["alerta"] == 0) & (merged["falla_real"] == 0), "resultado"] = "TN"
+        merged.loc[(merged["alerta"] == 1) & (merged["falla_real"] == 0), "resultado"] = "FP"
+        merged.loc[(merged["alerta"] == 0) & (merged["falla_real"] == 1), "resultado"] = "FN"
+
+        now = pd.Timestamp.now()
+        merged["ventana_cerrada"] = (merged["fecha_evento"] + pd.Timedelta(days=horizon)) <= now
+        return merged
+
+    # ── Combined mode (horizon=None): aggregate all 3 horizons ──────
+    frames = []
+    for h in HORIZONS:
+        enriched = enrich_predictions(preds, failures, bus, h)
+        if not enriched.empty:
+            enriched = enriched.rename(columns={
+                "probability": f"prob_{h}d",
+                "alerta": f"alerta_{h}d",
+                "falla_real": f"falla_real_{h}d",
+            })
+            cols = ["fecha_evento"] + [c for c in enriched.columns if c.endswith(f"_{h}d")]
+            frames.append(enriched[cols + ["causa_sistema_reconstruida", "ventana_cerrada"]])
+    if not frames:
+        return pd.DataFrame()
+    combined = frames[0]
+    for f_df in frames[1:]:
+        combined = combined.merge(f_df, on=["fecha_evento", "causa_sistema_reconstruida", "ventana_cerrada"], how="outer", suffixes=("", "_drop"))
+        combined = combined.loc[:, ~combined.columns.str.endswith("_drop")]
+
+    combined["probability"] = combined[[c for c in combined.columns if c.startswith("prob_")]].max(axis=1, skipna=True)
+    combined["alerta"] = combined[[c for c in combined.columns if c.startswith("alerta_")]].any(axis=1).astype(int)
+    combined["falla_real"] = combined.get("falla_real_7d", 0)
+    combined["resultado"] = "N/A"
+    combined.loc[(combined["alerta"] == 1) & (combined["falla_real"] == 1), "resultado"] = "TP"
+    combined.loc[(combined["alerta"] == 0) & (combined["falla_real"] == 0), "resultado"] = "TN"
+    combined.loc[(combined["alerta"] == 1) & (combined["falla_real"] == 0), "resultado"] = "FP"
+    combined.loc[(combined["alerta"] == 0) & (combined["falla_real"] == 1), "resultado"] = "FN"
+    combined["ventana_cerrada"] = (combined["fecha_evento"] + pd.Timedelta(days=7)) <= pd.Timestamp.now()
+    return combined
+
+
+def make_timeline_chart(df: pd.DataFrame, title: str = "", height: int = 300):
+    if df.empty:
+        return go.Figure()
+
+    fig = go.Figure()
+
+    filled_df = df.sort_values("fecha_evento")
+    dates = filled_df["fecha_evento"]
+    probs = filled_df["probability"]
+
+    hovertemplate = (
+        "%{x|%d %b %Y %H:%M}<br>"
+        "Riesgo: %{y:.0%}<extra></extra>"
+    )
+    # For combined mode, show per-horizon breakdown in tooltip
+    has_breakdown = any(c.startswith("prob_") for c in df.columns)
+    if has_breakdown:
+        hovertemplate = (
+            "%{x|%d %b %Y %H:%M}<br>"
+            "Riesgo: %{y:.0%}<br>"
+            "3d: %{customdata[0]:.0%} | 5d: %{customdata[1]:.0%} | 7d: %{customdata[2]:.0%}"
+            "<extra></extra>"
+        )
+        customdata = filled_df[["prob_3d", "prob_5d", "prob_7d"]].values
+    else:
+        customdata = None
+
+    fig.add_trace(go.Scatter(
+        x=dates, y=probs,
+        mode="lines",
+        line=dict(color="#3b82f6", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(59, 130, 246, 0.15)",
+        name="Riesgo",
+        customdata=customdata,
+        hovertemplate=hovertemplate,
+    ))
+
+    for oc in ["TP", "TN", "FP", "FN"]:
+        sub = df[df["resultado"] == oc]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=sub["fecha_evento"],
+            y=sub["probability"],
+            mode="markers",
+            marker=dict(
+                symbol=OUTCOME_SYMBOL[oc],
+                size=OUTCOME_SIZE[oc],
+                color=OUTCOME_COLOR[oc],
+                line=dict(color="white", width=1.5),
+            ),
+            name=OUTCOME_LABEL[oc],
+            customdata=sub["causa_sistema_reconstruida"],
+            hovertemplate=(
+                f"{OUTCOME_EMOJI[oc]} %{{x|%d %b %Y %H:%M}}<br>"
+                f"Riesgo: %{{y:.0%}}<br>{OUTCOME_LABEL[oc]}<br>"
+                f"Causa: %{{customdata}}<extra></extra>"
+            ),
+        ))
+
+    fail_dates = df[df["falla_real"] == 1]["fecha_evento"]
+    if not fail_dates.empty:
+        fig.add_trace(go.Scatter(
+            x=fail_dates,
+            y=[1.02] * len(fail_dates),
+            customdata=df[df["falla_real"] == 1]["causa_sistema_reconstruida"],
+            mode="markers",
+            marker=dict(symbol="x", size=10, color="#ef4444", line=dict(width=1)),
+            name="Falla real ocurrida",
+            hovertemplate="💥 Falla real: %{x|%d %b %Y}<br>Causa: %{customdata}<extra></extra>",
+        ))
+
+    fig.add_hline(
+        y=DECISION_THRESHOLD,
+        line=dict(color="#ef4444", width=1.5, dash="dash"),
+        name=f"Umbral ({DECISION_THRESHOLD})",
+    )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="",
+        yaxis_title="Riesgo de falla",
+        yaxis=dict(range=[0, 1.08], tickformat=".0%"),
+        height=height,
+        margin=dict(l=10, r=10, t=30, b=30),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0, font_size=10),
+        template="plotly_white",
+    )
+    return fig
+
+
+# ── Load data ──────────────────────────────────────────────────────────────
+
+shadow_report = load_shadow_report()
+preds = load_predictions()
+if not preds.empty:
+    preds["fecha_evento"] = pd.to_datetime(preds["fecha_evento"])
+failures = get_failure_events()
+
+if shadow_report is None:
+    st.warning("Reporte no disponible. Ejecute: python3 scripts/evaluate_shadow.py")
+    st.stop()
+
+horizons = sorted(shadow_report.get("por_horizonte", {}).keys(), key=int)
+
+# Merge empresa_id into predictions (one empresa per bus)
+buses_empresa = load_base()[["placa_patente", "empresa_id"]].drop_duplicates().groupby("placa_patente").first().reset_index()
+preds = preds.merge(buses_empresa, on="placa_patente", how="left")
 
 # ── Sidebar ────────────────────────────────────────────────────────────────
 
-st.sidebar.title("🔧 Mantenimiento Predictivo")
-st.sidebar.caption("Panel de Gestion Predictiva")
-
-OPERADOR = st.sidebar.selectbox(
-    "Operador", ["Todos", "VOY", "REDBUS"],
-    help="Seleccione operador para ver su flota completa"
-)
-
-HORIZON = st.sidebar.selectbox("Ventana de prediccion", [3, 5, 7], index=2,
-                                help="Cuantos dias hacia adelante predecimos? 7d = una semana")
-THRESHOLD = st.sidebar.slider("Sensibilidad de alerta", 0.0, 1.0, 0.5, 0.05,
-                              help="Mas bajo = mas alertas (pero mas falsas alarmas)")
-
-# ── Carga y filtrado ──────────────────────────────────────────────────────
-
-all_preds = load_predictions()
-all_eventos = load_eventos()
-empresa_map = get_empresa_mapping()
-
-# Asignar operador a cada prediccion
-all_preds["empresa_id"] = all_preds["placa_patente"].map(empresa_map)
-
-# Filtrar por operador
-if OPERADOR != "Todos":
-    preds = all_preds[all_preds["empresa_id"] == OPERADOR].copy()
-    op_buses = empresa_map[empresa_map == OPERADOR].index
-    eventos = all_eventos[all_eventos["placa_patente"].isin(op_buses)].copy()
-else:
-    preds = all_preds.copy()
-    eventos = all_eventos.copy()
-
-preds_h = preds[preds["horizon_days"] == HORIZON].copy()
-preds_h["alerta"] = (preds_h["probability"] >= THRESHOLD).astype(bool)
-
-# Merge taller/causa info into predictions for quick lookup
-event_cols = ["placa_patente", "fecha_evento", "taller_planta", "taller_planta_norm", "causa_origen",
-              "sistema_componente", "tiene_repuestos_evento", "num_keywords_tecnicos_evento",
-              "duracion_ot_horas_prom_evento", "repuestos_count_evento",
-              "keyword_motor", "keyword_freno", "keyword_bateria", "keyword_puerta",
-              "keyword_aceite", "keyword_vidrio", "keyword_correa", "keyword_refrigerante",
-              "keyword_sensor", "keyword_espejo"]
-available_event_cols = [c for c in event_cols if c in eventos.columns]
-eventos_merged = eventos[available_event_cols].drop_duplicates(
-    subset=["placa_patente", "fecha_evento"])
-preds_h = preds_h.merge(eventos_merged, on=["placa_patente", "fecha_evento"], how="left")
-
-# Usar nombre de taller normalizado si existe
-taller_col = "taller_planta_norm" if "taller_planta_norm" in preds_h.columns else "taller_planta"
-taller_options = sorted(preds_h[taller_col].dropna().unique())
-TALLER = st.sidebar.multiselect(
-    "Terminal / Taller",
-    options=taller_options,
-    default=[],
-    help="Filtrar por terminal o taller especifico"
-)
-if TALLER:
-    preds_h = preds_h[preds_h[taller_col].isin(TALLER)]
-
-# ── Helper: buscar keyword mas frecuente para un bus ──────────────────────
-
-def top_keywords_for_bus(bus_df: pd.DataFrame, top_n: int = 3) -> list[str]:
-    kw_cols = [c for c in bus_df.columns if c.startswith("keyword_") and not c.startswith("keyword_tecnicos")]
-    scores = {}
-    for c in kw_cols:
-        scores[c.replace("keyword_", "")] = int(bus_df[c].fillna(0).sum())
-    return sorted(scores.items(), key=lambda x: -x[1])[:top_n]
-
-# ══════════════════════════════════════════════════════════════════════════
-# HEADER
-# ══════════════════════════════════════════════════════════════════════════
-
 with st.sidebar:
-    st.divider()
-    total_buses = preds_h["placa_patente"].nunique()
-    total_eventos = len(preds_h)
-    total_alertas = preds_h["alerta"].sum()
-    op_label = f" — {OPERADOR}" if OPERADOR != "Todos" else ""
-    st.metric(f"Buses monitoreados{op_label}", f"{total_buses}")
-    st.metric("Alertas activas", f"{total_alertas}",
-              delta=f"{total_alertas/max(total_eventos,1)*100:.0f}% del total")
+    st.header("🚌 Bus a analizar")
+    all_empresas = ["Todas"] + sorted(preds["empresa_id"].dropna().unique().tolist())
+    sel_empresa = st.selectbox("Cliente", all_empresas, index=0)
 
-    st.divider()
-    st.caption("🏠 Inicio")
-    st.caption("v1.0 — Datos VOY + REDBUS + Modelo predictivo")
+    filtered = preds
+    if sel_empresa != "Todas":
+        filtered = filtered[filtered["empresa_id"] == sel_empresa]
+    all_buses = sorted(filtered["placa_patente"].dropna().unique()) if not filtered.empty else []
 
-# ── Texto descriptivo para el operador activo ────────────────────────────
-operador_txt = OPERADOR if OPERADOR != "Todos" else "ambos operadores"
+    if "selected_bus" not in st.session_state:
+        st.session_state.selected_bus = all_buses[0] if all_buses else None
+    if st.session_state.selected_bus not in all_buses:
+        st.session_state.selected_bus = all_buses[0] if all_buses else None
 
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 1: TALLER HOY — para el mecanico
-# ══════════════════════════════════════════════════════════════════════════
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🏭 Taller Hoy", "🚌 Consultar Bus", "📋 Flota en Riesgo",
-    "🔧 Repuestos y Fallas", "📈 Tendencias",
-])
-
-with tab1:
-    st.header("🏭 Taller Hoy — ¿Que necesita atencion?")
-    st.info(
-        "Buses con mayor probabilidad de falla en los proximos "
-        f"{HORIZON} dias. Ordene por riesgo para priorizar."
+    sel = st.selectbox(
+        "Selecciona un bus",
+        all_buses,
+        index=all_buses.index(st.session_state.selected_bus) if st.session_state.selected_bus in all_buses else 0,
+        label_visibility="collapsed",
     )
+    st.session_state.selected_bus = sel
+    st.caption("Todas las secciones abajo usan este bus")
 
-    min_risk_filter = st.slider("Riesgo minimo (%)", 0, 100, 60, 5,
-                                help="Mostrar solo buses con riesgo >= este valor")
+    st.divider()
+    st.markdown("**📅 Período**")
+    pred_date_min = preds["fecha_evento"].min().date()
+    pred_date_max = preds["fecha_evento"].max().date()
+    date_range = st.slider(
+        "Mostrar predicciones desde",
+        min_value=pred_date_min,
+        max_value=pred_date_max,
+        value=(pred_date_max - pd.Timedelta(days=90), pred_date_max),
+        format="YYYY-MM-DD",
+        label_visibility="collapsed",
+    )
+    st.session_state.date_range = date_range
 
-    # Filter data
-    df = preds_h[preds_h["alerta"]].copy()
-    df = df[df["probability"] >= min_risk_filter / 100]
+# ═══════════════════════════════════════════════════════════════════════════
+# HEADER
+# ═══════════════════════════════════════════════════════════════════════════
 
-    if df.empty:
-        st.warning("No hay buses que cumplan los filtros.")
+st.markdown(
+    """
+    <div style='text-align:center; padding: 0.5rem 0 1rem;'>
+        <h1 style='margin:0; font-size:2rem;'>🚍 Predicción de Fallas — Piloto 1</h1>
+        <p style='color:#666; font-size:1rem; max-width:700px; margin:0.3rem auto;'>
+            El modelo analiza el historial de cada bus y calcula el riesgo de que tenga
+            una falla en los próximos <b>3, 5 y 7 días</b>. Cada predicción se compara
+            con lo que realmente ocurrió para medir su precisión.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+meta = shadow_report.get("metadata", {})
+total_preds = meta.get("total_predicciones", 0)
+
+# Global accuracy at DECISION_THRESHOLD (summed across all horizons)
+total_tp = total_tn = total_fp = total_fn = 0
+for h in horizons:
+    tm = shadow_report["por_horizonte"][h]["threshold_metrics"].get(str(DECISION_THRESHOLD), {})
+    cm = tm.get("confusion_matrix", [])
+    if cm:
+        tn, fp, fn, tp = cm[0][0], cm[0][1], cm[1][0], cm[1][1]
+        total_tp += tp
+        total_tn += tn
+        total_fp += fp
+        total_fn += fn
+
+total_all = total_tp + total_tn + total_fp + total_fn
+global_acc = (total_tp + total_tn) / total_all if total_all > 0 else 0
+total_alerts = total_tp + total_fp
+
+kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+kpi1.metric("🚌 Buses monitoreados", meta.get("total_buses", 0))
+kpi2.metric("📊 Predicciones totales", f"{total_preds:,}")
+kpi3.metric("🔔 Alertas emitidas", f"{total_alerts:,}")
+kpi4.metric("🎯 Acierto global", f"{global_acc*100:.1f}%")
+kpi5.metric("📅 Última predicción",
+            str(pd.to_datetime(preds["fecha_evento"]).max().strftime("%d/%m/%Y")) if not preds.empty else "N/A")
+
+st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 1: GLOBAL RESULTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+st.subheader("📊 Resultados Globales por Ventana")
+st.caption("Para cada predicción se verifica si ocurrió una falla real en los días siguientes.")
+
+global_rows = []
+for h in horizons:
+    m = shadow_report["por_horizonte"][h]
+    tm = m["threshold_metrics"].get(str(DECISION_THRESHOLD), {})
+    cm = tm.get("confusion_matrix", [])
+    if cm:
+        tn, fp, fn, tp = cm[0][0], cm[0][1], cm[1][0], cm[1][1]
+        correctas = tp + tn
+        incorrectas = fp + fn
     else:
-        # Group by bus: take latest event per bus
-        latest = df.sort_values("fecha_evento").groupby("placa_patente").last().reset_index()
-        latest = latest.sort_values("probability", ascending=False)
+        correctas = incorrectas = 0
 
-        for _, row in latest.head(20).iterrows():
-            risk_pct = row["probability"] * 100
-            sev = row.get("severity", "MEDIUM")
-            sev_icon = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(sev, "⚪")
-            taller = row.get(taller_col, row.get("taller_planta", "?"))
-            causa = row.get("causa_origen", "?")
+    global_rows.append({
+        "Ventana": f"{h} días",
+        "Predicciones": f"{m.get('total_predicciones', 0):,}",
+        "Correctas ✅": correctas,
+        "Incorrectas ❌": incorrectas,
+    })
 
-            # Top keywords for this bus
-            bus_df = preds_h[preds_h["placa_patente"] == row["placa_patente"]]
-            kws = top_keywords_for_bus(bus_df)
+global_rows.append({
+    "Ventana": "**TOTAL**",
+    "Predicciones": f"{total_all:,}",
+    "Correctas ✅": total_tp + total_tn,
+    "Incorrectas ❌": total_fp + total_fn,
+})
 
-            with st.container(border=True):
-                c1, c2, c3, c4 = st.columns([2, 1, 2, 2])
-                c1.markdown(f"### {sev_icon} **{row['placa_patente']}**")
-                c1.caption(f"Taller: {taller} · Causa: {causa}")
+st.dataframe(global_rows, width="stretch", hide_index=True)
 
-                bar_color = "red" if risk_pct >= 75 else "orange" if risk_pct >= 50 else "yellow"
-                c2.markdown(f"# {risk_pct:.0f}%")
-                c2.progress(int(risk_pct), text="riesgo")
-                c2.caption(f"Severidad: {sev}")
+st.info(
+    "📈 Las ventanas indican el plazo de la predicción: 3 días (muy corto plazo), "
+    "5 días (corto plazo), 7 días (semanal)."
+)
 
-                if kws:
-                    kw_text = ", ".join(f"**{k}** ({v})" for k, v in kws)
-                    c3.markdown("**Posibles problemas:**")
-                    c3.markdown(kw_text)
-                else:
-                    c3.markdown("*Sin datos de falla*")
+st.divider()
 
-                ult_evento = str(row["fecha_evento"])[:16] if pd.notna(row["fecha_evento"]) else "?"
-                c4.markdown(f"**Ultimo evento:** {ult_evento}")
-                c4.markdown(f"**Repuestos:** {row.get('repuestos_count_evento', 0)}")
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 2: BUS ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 2: CONSULTAR BUS
-# ══════════════════════════════════════════════════════════════════════════
+st.subheader("🚌 Análisis por Bus")
 
-with tab2:
-    st.header("🚌 Consultar Bus")
-    st.info(f"Seleccione un bus para ver su historial completo, riesgos y patrones de falla ({operador_txt}).")
+if preds.empty:
+    st.stop()
 
-    bus_list = sorted(preds_h["placa_patente"].unique())
-    selected = st.selectbox("Bus o patente:", bus_list)
+bus = st.session_state.get("selected_bus")
 
-    if selected:
-        bus_preds = preds_h[preds_h["placa_patente"] == selected].sort_values("fecha_evento")
-        bus_events = eventos[eventos["placa_patente"] == selected].sort_values("fecha_evento")
+if bus is None or bus not in sorted(preds["placa_patente"].dropna().unique()):
+    st.warning("Selecciona un bus en la barra lateral.")
+    st.stop()
 
-        # KPIs
-        k1, k2, k3, k4, k5 = st.columns(5)
-        total_ev = len(bus_preds)
-        alertas = bus_preds["alerta"].sum()
-        riesgo_prom = bus_preds["probability"].mean() * 100
-        riesgo_max = bus_preds["probability"].max() * 100
-        sev_alta = bus_preds["severity"].value_counts().get("HIGH", 0)
-        k1.metric("Eventos", total_ev)
-        k2.metric("Alertas", alertas, f"{alertas/max(total_ev,1)*100:.0f}%")
-        k3.metric("Riesgo Promedio", f"{riesgo_prom:.0f}%")
-        k4.metric("Riesgo Maximo", f"{riesgo_max:.0f}%")
-        k5.metric("Alta Severidad", sev_alta)
+# ── Per-horizon metrics for selected bus ──────────────────────────────────
+bus_rows = []
+for h in HORIZONS:
+    enriched = enrich_predictions(preds, failures, bus, h)
+    closed = enriched[enriched["ventana_cerrada"]]
+    n = len(closed)
+    if n < 3:
+        continue
+    correctas = int((closed["alerta"] == closed["falla_real"]).sum())
+    incorrectas = n - correctas
+    tp = int((closed["resultado"] == "TP").sum())
+    fp = int((closed["resultado"] == "FP").sum())
+    fn = int((closed["resultado"] == "FN").sum())
+    tn = int((closed["resultado"] == "TN").sum())
+    bus_rows.append({
+        "Ventana": f"{h}d",
+        "Predicciones": n,
+        "Correctas ✅": correctas,
+        "Incorrectas ❌": incorrectas,
+        "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+    })
 
-        # Timeline
-        st.subheader("Evolucion del riesgo en el tiempo")
-        timeline = bus_preds[["fecha_evento", "probability", "alerta", "severity"]].copy()
-        timeline["fecha_evento"] = pd.to_datetime(timeline["fecha_evento"])
-        timeline = timeline.set_index("fecha_evento")
-        st.line_chart(timeline[["probability"]], width="stretch")
+if bus_rows:
+    st.dataframe(bus_rows, width="stretch", hide_index=True)
 
-        # Ultimos eventos con detalle
-        st.subheader("Ultimos eventos")
-        cols_show = ["fecha_evento", "probability", "alerta", "severity",
-                     taller_col, "causa_origen", "sistema_componente",
-                     "repuestos_count_evento", "num_keywords_tecnicos_evento"]
-        avail_cols = [c for c in cols_show if c in bus_preds.columns]
-        ultimos = bus_preds[avail_cols].sort_values("fecha_evento", ascending=False).head(20).copy()
-        ultimos["Riesgo"] = ultimos["probability"].apply(lambda p: f"{p*100:.0f}%")
-        ultimos["Alerta"] = ultimos["alerta"].apply(lambda a: "⚠️ SI" if a else "✅ no")
-        ultimos["Fecha"] = pd.to_datetime(ultimos["fecha_evento"]).dt.strftime("%d-%m-%Y")
-        display_map = {"Fecha": "Fecha", "Riesgo": "Riesgo", "Alerta": "Alerta",
-                       "severity": "Sev.", taller_col: "Taller",
-                       "causa_origen": "Causa", "repuestos_count_evento": "Respuestos"}
-        disp = {k: v for k, v in display_map.items() if k in ultimos.columns}
-        st.dataframe(ultimos[list(disp.keys())].rename(columns=disp),
-                     width="stretch", hide_index=True)
+# ── Timeline for selected bus ────────────────────────────────────────────
+st.subheader(f"📅 Línea de Tiempo — {bus}")
+st.caption("Cada punto es una predicción. El color indica si acertó o no. Las ❌ en la parte superior marcan fallas reales.")
 
-        # Patrones de falla
-        st.subheader("Patrones de falla historicos")
-        col_pat1, col_pat2 = st.columns(2)
-        with col_pat1:
-            kws = top_keywords_for_bus(bus_preds, 5)
-            if kws:
-                st.markdown("**Problemas mas frecuentes:**")
-                for k, v in kws:
-                    barr = "█" * min(v, 30)
-                    st.markdown(f"{k}: {barr} ({v} eventos)")
-        with col_pat2:
-            tc = taller_col if taller_col in bus_events.columns else "taller_planta"
-            if tc in bus_events.columns:
-                talleres = bus_events[tc].value_counts()
-                st.markdown("**Talleres que lo atendieron:**")
-                for t, c in talleres.items():
-                    st.markdown(f"- {t}: {c} veces")
-
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 3: FLOTA EN RIESGO
-# ══════════════════════════════════════════════════════════════════════════
-
-with tab3:
-    st.header("📋 Flota en Riesgo")
-    st.info("Todos los buses ordenados por nivel de riesgo. Use los filtros para enfocarse.")
-
-    sev_filter = st.multiselect("Severidad:", ["LOW", "MEDIUM", "HIGH"], default=[])
-
-    top_n = st.slider("Cuantos buses mostrar:", 10, 200, 50, 10)
-
-    df = preds_h.copy()
-    if sev_filter:
-        df = df[df["severity"].isin(sev_filter)]
-
-    bus_agg = (
-        df.groupby("placa_patente")
-        .agg(
-            eventos=("alerta", "count"),
-            alertas=("alerta", "sum"),
-            riesgo_prom=("probability", "mean"),
-            riesgo_max=("probability", "max"),
-            severidad_alta=("severity", lambda s: (s == "HIGH").sum()),
-            ultimo_evento=("fecha_evento", "max"),
-        )
-        .reset_index()
+leg_cols = st.columns(4)
+for i, oc in enumerate(["TP", "TN", "FP", "FN"]):
+    leg_cols[i].markdown(
+        f"<span style='color:{OUTCOME_COLOR[oc]}; font-size:1.2rem;'>{OUTCOME_EMOJI[oc]}</span> "
+        f"<span style='font-size:0.85rem;'>{OUTCOME_LABEL[oc]}</span>",
+        unsafe_allow_html=True,
     )
-    bus_agg["tasa_alerta"] = bus_agg["alertas"] / bus_agg["eventos"] * 100
-    bus_agg["riesgo_prom"] = bus_agg["riesgo_prom"] * 100
-    bus_agg["riesgo_max"] = bus_agg["riesgo_max"] * 100
-    bus_agg["urgencia"] = bus_agg["riesgo_prom"] * 0.3 + bus_agg["riesgo_max"] * 0.7
-    bus_agg = bus_agg.sort_values("urgencia", ascending=False).head(top_n)
 
-    bus_agg["Ultimo"] = pd.to_datetime(bus_agg["ultimo_evento"]).dt.strftime("%d-%m-%Y")
-    display = bus_agg.rename(columns={
-        "placa_patente": "Bus", "eventos": "Eventos", "alertas": "Alertas",
-        "tasa_alerta": "% Alerta", "riesgo_prom": "Riesgo Prom",
-        "riesgo_max": "Max Riesgo", "severidad_alta": "Alta Sev",
-    })[["Bus", "Eventos", "Alertas", "% Alerta", "Riesgo Prom", "Max Riesgo", "Alta Sev", "Ultimo"]]
-    display["% Alerta"] = display["% Alerta"].round(1)
-    display["Riesgo Prom"] = display["Riesgo Prom"].round(1)
-    display["Max Riesgo"] = display["Max Riesgo"].round(1)
+h_timeline = st.selectbox("Horizonte", ["Combinado", "3 días", "5 días", "7 días"], index=0, key="tl_horizon")
+h_val_map_tl = {"Combinado": None, "3 días": 3, "5 días": 5, "7 días": 7}
+h_val = h_val_map_tl[h_timeline]
 
-    st.dataframe(display, width="stretch", hide_index=True)
+enriched = enrich_predictions(preds, failures, bus, h_val)
+if enriched.empty:
+    st.info("Sin datos para este bus en el horizonte seleccionado.")
+else:
+    fecha_desde, fecha_hasta = st.session_state.get("date_range", (None, None))
+    if fecha_desde and fecha_hasta:
+        enriched = enriched[
+            (enriched["fecha_evento"] >= pd.Timestamp(fecha_desde))
+            & (enriched["fecha_evento"] <= pd.Timestamp(fecha_hasta))
+        ].copy()
+    if enriched.empty:
+        st.info("Sin predicciones en el período seleccionado.")
+    else:
+        cerradas = enriched[enriched["ventana_cerrada"]]
+        total_c = len(cerradas)
+        if total_c:
+            correctas = int((cerradas["alerta"] == cerradas["falla_real"]).sum())
+            pct = correctas / total_c * 100
+            pend = len(enriched) - total_c
+            tp = int((cerradas["resultado"] == "TP").sum())
+            fp = int((cerradas["resultado"] == "FP").sum())
+            fn = int((cerradas["resultado"] == "FN").sum())
+            tn = int((cerradas["resultado"] == "TN").sum())
+        else:
+            correctas = pct = pend = tp = fp = fn = tn = 0
 
-    st.subheader("Distribucion del riesgo en la flota")
-    hist_data = preds_h.groupby("placa_patente")["probability"].max().reset_index()
-    hist_data["categoria"] = pd.cut(hist_data["probability"],
-                                     bins=[0, 0.25, 0.5, 0.75, 1.0],
-                                     labels=["Bajo", "Medio", "Alto", "Critico"])
-    cat_counts = hist_data["categoria"].value_counts().reindex(["Bajo", "Medio", "Alto", "Critico"], fill_value=0)
-    st.bar_chart(cat_counts, width="stretch")
+        mini_cols = st.columns(5)
+        mini_cols[0].metric("Predicciones", len(enriched))
+        mini_cols[1].metric("✅ Correctas", correctas, delta=f"{pct:.0f}%" if total_c else None)
+        mini_cols[2].metric("🟠 Falsas alarmas", fp)
+        mini_cols[3].metric("🔴 Fallas no detectadas", fn)
+        mini_cols[4].metric("⏳ Pendientes", pend)
 
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 4: REPUESTOS Y FALLAS
-# ══════════════════════════════════════════════════════════════════════════
+        fig = make_timeline_chart(enriched, height=300)
+        st.plotly_chart(fig, width="stretch")
 
-with tab4:
-    st.header("🔧 Repuestos y Fallas")
-    st.info(f"Patrones de repuestos y tipos de falla en la flota {operador_txt}.")
+        with st.expander("Ver últimos eventos"):
+            recent = enriched.sort_values("fecha_evento", ascending=False).head(30)
+            for _, r in recent.iterrows():
+                emoji = OUTCOME_EMOJI.get(r["resultado"], "⏳")
+                color = OUTCOME_COLOR.get(r["resultado"], "#999")
+                dt = r["fecha_evento"].strftime("%d %b %H:%M")
+                risk = f"{r['probability']*100:.0f}%"
+                alerta = "🔔 Alerta" if r["alerta"] else "—"
+                falla = "💥 Falla" if r["falla_real"] else "—"
+                causa = r.get("causa_sistema_reconstruida", "N/A") if r.get("falla_real") else "—"
+                estado = OUTCOME_LABEL.get(r["resultado"], "Pendiente")
+                st.markdown(
+                    f"<span style='color:{color}'>{emoji}</span> "
+                    f"**{dt}** | Riesgo: {risk} | {alerta} | {falla} | Causa: **{causa}** | "
+                    f"<span style='color:{color};font-size:0.85rem;'>{estado}</span>",
+                    unsafe_allow_html=True,
+                )
 
-    col_r1, col_r2 = st.columns(2)
-    with col_r1:
-        st.subheader("Tipos de problema mas frecuentes")
-        kw_cols = [c for c in preds_h.columns if c.startswith("keyword_")
-                   and not c.startswith("keyword_tecnicos")]
-        kw_data = {}
-        for c in kw_cols:
-            name = c.replace("keyword_", "").title()
-            kw_data[name] = int(preds_h[c].fillna(0).sum())
-        kw_df = pd.DataFrame(list(kw_data.items()), columns=["Problema", "Eventos"])
-        kw_df = kw_df.sort_values("Eventos", ascending=False)
-        st.bar_chart(kw_df.set_index("Problema"), width="stretch")
+st.divider()
 
-    with col_r2:
-        st.subheader("Eventos con repuestos vs sin repuestos")
-        if "tiene_repuestos_evento" in preds_h.columns:
-            rep_data = preds_h["tiene_repuestos_evento"].value_counts().rename(
-                index={0: "Sin repuestos", 1: "Con repuestos"})
-            st.bar_chart(rep_data, width="stretch")
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 3: DETAILED PREDICTIONS TABLE
+# ═══════════════════════════════════════════════════════════════════════════
 
-    st.subheader("Distribucion por causa")
-    if "causa_origen" in preds_h.columns:
-        causa_counts = preds_h["causa_origen"].value_counts().head(10)
-        st.bar_chart(causa_counts, width="stretch")
+st.subheader(f"📋 Predicciones Detalladas — {bus}")
 
-    st.subheader("Talleres por volumen de atencion")
-    tc = taller_col if taller_col in preds_h.columns else "taller_planta"
-    if tc in preds_h.columns:
-        talleres = preds_h[tc].value_counts()
-        st.bar_chart(talleres, width="stretch")
+h_filter = st.selectbox("Filtrar por ventana", ["Combinado", "3 días", "5 días", "7 días", "Todas"])
+h_val_map = {"Combinado": -1, "3 días": 3, "5 días": 5, "7 días": 7, "Todas": None}
+h_filter_val = h_val_map[h_filter]
 
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 5: TENDENCIAS — para el ingeniero
-# ══════════════════════════════════════════════════════════════════════════
+bp = preds[preds["placa_patente"] == bus].copy()
+bp["fecha_evento"] = pd.to_datetime(bp["fecha_evento"])
 
-with tab5:
-    st.header("📈 Tendencias")
-    st.info("Evolucion de alertas, severidad y salud de flota en el tiempo.")
+fecha_desde, fecha_hasta = st.session_state.get("date_range", (None, None))
+if fecha_desde and fecha_hasta:
+    bp = bp[
+        (bp["fecha_evento"] >= pd.Timestamp(fecha_desde))
+        & (bp["fecha_evento"] <= pd.Timestamp(fecha_hasta))
+    ].copy()
 
-    preds_h["fecha_evento"] = pd.to_datetime(preds_h["fecha_evento"])
-    preds_h["semana"] = preds_h["fecha_evento"].dt.isocalendar().week.astype(int)
-    preds_h["anio"] = preds_h["fecha_evento"].dt.year
-    preds_h["mes"] = preds_h["fecha_evento"].dt.month
-
-    st.subheader("Alertas por semana")
-    weekly = preds_h.groupby(["anio", "semana"]).agg(
-        eventos=("alerta", "count"), alertas=("alerta", "sum")
+if h_filter_val == -1:
+    # Combined: one row per event, max prob across horizons
+    bp = bp.sort_values("fecha_evento")
+    grouped = bp.groupby("fecha_evento").agg(
+        probability=("probability", "max"),
+        alert=("alert", "max"),
+        horizon_days=("horizon_days", lambda x: "C"),
     ).reset_index()
-    weekly["label"] = weekly["anio"].astype(str) + "-S" + weekly["semana"].astype(str)
-    weekly["tasa"] = weekly["alertas"] / weekly["eventos"] * 100
-    st.line_chart(weekly.set_index("label")[["tasa"]], width="stretch")
+    bp = grouped.sort_values("fecha_evento", ascending=False)
+elif h_filter_val is not None:
+    bp = bp[bp["horizon_days"] == h_filter_val]
+    bp = bp.sort_values(["fecha_evento", "horizon_days"], ascending=False)
 
-    st.subheader("Volumen de eventos por mes")
-    monthly = preds_h.groupby(["anio", "mes"]).agg(
-        eventos=("alerta", "count"), alertas=("alerta", "sum")
-    ).reset_index()
-    monthly["label"] = monthly["anio"].astype(str) + "-" + monthly["mes"].astype(str).str.zfill(2)
-    st.bar_chart(monthly.set_index("label")[["eventos", "alertas"]], width="stretch")
-
-    st.subheader("Severidad a lo largo del tiempo")
-    sev_trend = preds_h.copy()
-    sev_trend["periodo"] = sev_trend["fecha_evento"].dt.to_period("M").astype(str)
-    if "severity" in sev_trend.columns:
-        sev_pivot = sev_trend.groupby(["periodo", "severity"]).size().unstack(fill_value=0)
-        st.bar_chart(sev_pivot, width="stretch")
-
-    # Metricas del modelo (al fondo, para el ingeniero)
-    with st.expander("📐 Metricas del modelo (para referencia)"):
-        st.json({
-            "horizon": HORIZON,
-            "threshold": THRESHOLD,
-            "buses_monitoreados": int(preds_h["placa_patente"].nunique()),
-            "total_eventos": int(len(preds_h)),
-            "total_alertas": int(preds_h["alerta"].sum()),
-            "tasa_alertas_pct": round(preds_h["alerta"].mean() * 100, 1),
+if bp.empty:
+    st.info("Sin predicciones para este bus.")
+else:
+    detail_rows = []
+    for _, r in bp.iterrows():
+        prob = float(r["probability"])
+        alert = bool(r["alert"])
+        sev = r.get("severity", "N/A")
+        h_label = str(r["horizon_days"]) if r["horizon_days"] != "C" else "C"
+        detail_rows.append({
+            "Fecha": r["fecha_evento"].strftime("%Y-%m-%d %H:%M"),
+            "Ventana": f'{h_label}',
+            "Riesgo": f"{prob*100:.0f}%",
+            "Decisión": "🔔 Alerta" if alert else "—",
+            "Severidad": sev,
         })
+    st.dataframe(detail_rows, width="stretch", hide_index=True)
+
+st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOOTER
+# ═══════════════════════════════════════════════════════════════════════════
+
+with st.expander("ℹ️ Detalles técnicos"):
+    st.markdown(f"""
+**Modelo:** XGBoost | **Config:** `experiments/009_th06_all`
+
+**¿Cómo funciona?**
+1. Se entrena un modelo por cada ventana (3, 5, 7 días) con datos históricos recientes.
+2. Para cada evento de cada bus, el modelo calcula un riesgo (0-100%).
+3. Si el riesgo supera el umbral ({DECISION_THRESHOLD}), se emite una alerta.
+4. Cada predicción se compara contra la realidad para medir la efectividad.
+
+**Comandos:**
+- `python3 scripts/evaluate_shadow.py` — generar reporte
+- `python3 scripts/consultar_bus.py FLXS22` — consultar predicciones CLI
+    """)

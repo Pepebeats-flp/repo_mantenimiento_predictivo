@@ -5,4 +5,5 @@ xgboost
 imbalanced-learn
 matplotlib
 pyarrow
+firebase-admin
 
