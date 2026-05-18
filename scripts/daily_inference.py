@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore")
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from src.data_loader import load_from_firestore
+from src.data_loader import load_from_firestore, load_json_files, load_single_json, normalize_inspection_records
 from src.preprocessing import (
     clean_data,
     create_base_dataframe,
@@ -34,37 +34,60 @@ from src.feature_engineering import (
     generate_rolling_features,
     generate_system_features,
     generate_text_pattern_features,
+    generate_event_type_features,
+    generate_severity_features,
+    generate_trend_features,
+    generate_bus_age_features,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
 PREDICTIONS_DIR = PROJECT_ROOT / "data" / "predictions"
+DATA_RAW_DIR = PROJECT_ROOT / "data" / "raw"
 
 HORIZONS = [7, 5, 3]
 THRESHOLD = 0.5
 LABEL = "voy_redbus"
 
+CLIENT_MAP: dict = {
+    "14": "VOY", "15": "VOY",
+    "11": "REDBUS", "13": "REDBUS",
+    "8": "METROPOL", "9": "METROPOL",
+    "16": "GRANAMERICAS",
+    "17": "CONECTA", "19": "CONECTA",
+}
 
-def run_daily_inference():
+
+def run_daily_inference(use_firestore: bool = True, recent_days: int | None = None):
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 60)
-    print("DAILY INFERENCE: Fetching latest data from Firestore")
-    print("=" * 60)
+    if use_firestore:
+        print("=" * 60)
+        print("DAILY INFERENCE: Fetching latest data from Firestore")
+        print("=" * 60)
+        prev_raw, corr_raw = load_from_firestore()
+        clean_df = clean_data(prev_raw, corr_raw, empresa_id="ALL")
+    else:
+        print("=" * 60)
+        print("DAILY INFERENCE: Loading local JSON files")
+        print("=" * 60)
+        firestore_dir = DATA_RAW_DIR / "firestore"
+        prev_raw, corr_raw = load_json_files(
+            firestore_dir / "preventivos.json",
+            firestore_dir / "correctivos.json",
+        )
+        regb_raw = load_single_json(firestore_dir / "estado_general.json")
+        it_raw = load_single_json(firestore_dir / "inspeccion_tecnica.json")
+        regb_df = normalize_inspection_records(regb_raw, "REGB") if regb_raw else None
+        it_df = normalize_inspection_records(it_raw, "IT") if it_raw else None
+        print(f"  Preventivos: {len(prev_raw)}, Correctivos: {len(corr_raw)}")
+        print(f"  REGB: {len(regb_df) if regb_df is not None else 0}, IT: {len(it_df) if it_df is not None else 0}")
+        clean_df = clean_data(prev_raw, corr_raw, regb_df=regb_df, it_df=it_df, empresa_id="ALL")
 
-    # Step 1: Load from Firestore
-    prev_raw, corr_raw = load_from_firestore()
-    clean_df = clean_data(prev_raw, corr_raw, empresa_id="ALL")
     clean_df = extract_additional_fields(clean_df)
 
     if "unidad_negocio" in clean_df.columns:
-        clean_df["empresa_id"] = clean_df["unidad_negocio"].map(
-            {"14": "VOY", "15": "VOY",
-             "11": "REDBUS", "13": "REDBUS",
-             "8": "METROPOL", "9": "METROPOL",
-             "16": "GRANAMERICAS",
-             "17": "CONECTA", "19": "CONECTA"}
-        ).fillna("OTROS")
+        clean_df["empresa_id"] = clean_df["unidad_negocio"].map(CLIENT_MAP).fillna("OTROS")
 
     base_df = create_base_dataframe(clean_df, executed_only=True)
     print(f"  Records: {len(base_df)}, Buses: {base_df['placa_patente'].nunique()}")
@@ -75,6 +98,13 @@ def run_daily_inference():
     eventos_df = merge_additional_event_fields(base_df, eventos_df)
     print(f"  Events: {len(eventos_df)}, Buses: {eventos_df['placa_patente'].nunique()}")
 
+    # Optionally filter to recent data only for faster inference
+    if recent_days is not None:
+        _cutoff = pd.Timestamp.now() - pd.Timedelta(days=recent_days)
+        _before = len(eventos_df)
+        eventos_df = eventos_df[eventos_df["fecha_evento"] >= _cutoff].copy()
+        print(f"  Filtered to last {recent_days} days: {_before} → {len(eventos_df)} events")
+
     # Step 3: Feature engineering
     features_df = generate_bus_history_features(eventos_df)
     features_df = generate_rolling_features(features_df)
@@ -82,6 +112,10 @@ def run_daily_inference():
     features_df = generate_system_features(features_df)
     features_df = generate_inventory_features(features_df)
     features_df = generate_text_pattern_features(features_df)
+    features_df = generate_event_type_features(features_df)
+    features_df = generate_severity_features(features_df)
+    features_df = generate_trend_features(features_df)
+    features_df = generate_bus_age_features(features_df)
     features_df = create_temporal_features(features_df)
     features_df = create_future_targets(features_df, windows=(7, 5, 3, 10, 14, 30))
     print(f"  Features shape: {features_df.shape}")
@@ -180,4 +214,11 @@ def run_daily_inference():
 
 
 if __name__ == "__main__":
-    run_daily_inference()
+    import argparse
+    parser = argparse.ArgumentParser(description="Daily inference for Piloto 1")
+    parser.add_argument("--local-json", action="store_true",
+                        help="Usar archivos JSON locales en vez de Firestore")
+    parser.add_argument("--recent-days", type=int, default=None,
+                        help="Procesar solo los últimos N días (más rápido)")
+    args = parser.parse_args()
+    run_daily_inference(use_firestore=not args.local_json, recent_days=args.recent_days)

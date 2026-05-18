@@ -292,6 +292,8 @@ preds = preds.merge(buses_empresa, on="placa_patente", how="left")
 
 with st.sidebar:
     st.header("🚌 Bus a analizar")
+    st.radio("Navegación", ["📊 Dashboard", "📖 Documentación"], key="nav_page",
+             label_visibility="collapsed")
     all_empresas = ["Todas"] + sorted(preds["empresa_id"].dropna().unique().tolist())
     sel_empresa = st.selectbox("Cliente", all_empresas, index=0)
 
@@ -328,6 +330,346 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     st.session_state.date_range = date_range
+
+nav_page = st.session_state.get("nav_page", "📊 Dashboard")
+
+if nav_page == "📖 Documentación":
+    # ═══════════════════════════════════════════════════════════════════════
+    # DOCUMENTATION PAGE
+    # ═══════════════════════════════════════════════════════════════════════
+
+    st.markdown(
+        "<h1 style='text-align:center;'>📖 Documentación del Sistema</h1>"
+        "<p style='text-align:center;color:#666;'>Predicción de Eventos — Piloto 1</p>",
+        unsafe_allow_html=True,
+    )
+
+    st.divider()
+
+    # ── 1. Resumen ───────────────────────────────────────────────────
+    with st.expander("📋 Resumen del Proyecto", expanded=True):
+        st.markdown(f"""
+**Piloto 1** es un sistema de **mantenimiento predictivo** que analiza el historial de
+mantenimiento de cada bus y calcula la probabilidad de que tenga un evento en los
+próximos **3, 5 y 7 días**. El sistema opera en **Shadow Mode**: las predicciones se
+generan y se comparan contra la realidad para medir su precisión, sin intervenir en
+las operaciones.
+
+- **Objetivo**: anticipar eventos y notificar de forma oporturna.
+- **Alcance**: flota completa de buses de todos los clientes ({shadow_report.get('metadata', {}).get('total_buses', 0)} buses)
+- **Estado**: Shadow Mode — evaluación continua contra eventos reales
+- **Última evaluación**: {shadow_report.get('metadata', {}).get('fecha_evaluacion', 'N/A')[:10]}
+        """)
+
+    # ── 2. Origen de los Datos ───────────────────────────────────────
+    with st.expander("🗄️ Origen de los Datos", expanded=True):
+        st.markdown("""
+Los datos provienen de **Firestore** (base de datos en la nube) y se procesan a través
+de un pipeline ETL que consolida **4 tipos de servicio**:
+
+| Tipo  | Volumen |
+|---|---|
+| **CORRECTIVO** | ~259k registros |
+| **PREVENTIVO** | ~108k registros |
+| **REGB** |  ~23k registros |
+| **IT** |  ~17k registros |
+
+**Clientes incluidos** (mapeo desde unidad_negocio):
+
+| Cliente | Registros |
+|---|---|
+| **METROPOL** | ~153k |
+| **REDBUS** | ~110k |
+| **OTROS** (s/inspector, etc.) | ~85k |
+| **VOY** | ~37k |
+| **CONECTA** | ~22k |
+| **GRANAMERICAS** | ~1.7k |
+
+**Total**: ~408k registros de ~2,968 buses.
+**Rango de fechas**: 2021-02-09 → 2026-05-13 (~5 años de historia).
+        """)
+
+    # ── 3. Definición de Evento ───────────────────────────────────────
+    with st.expander("⚙️ Definición de Evento", expanded=True):
+        st.markdown("""
+No todos los registros de mantenimiento se consideran un **evento**. La condición
+`es_evento` se determina según el tipo de servicio:
+
+| Tipo | ¿Cuándo es evento? |
+|---|---|
+| **CORRECTIVO** | Solo si `causa_sistema_reconstruida` está en categorías significativas: **FRENOS, MOTOR, ELÉCTRICO, CLIMATIZACIÓN, RUEDAS, SUSPENSIÓN, PUERTAS**. |
+| **PREVENTIVO** | Cuando el mantenimiento programado es **rechazado** (`resultado == False/0`). Un preventivo que pasa exitosamente no es evento. |
+| **REGB / IT** | Cuando la inspección **no pasa** (`resultado_pasa == 0`) o tiene **defectos críticos** (`inspección_total_highs > 0`). |
+
+**Total de eventos identificados**: ~120,507.
+        """)
+
+    # ── 4. Pipeline de Entrenamiento ─────────────────────────────────
+    _cutoff = shadow_report.get('por_horizonte', {}).get('3', {}).get('auc_roc', 'N/A')
+    _meta_3d_path = Path("models/xgb_3d_voy_redbus_meta.json")
+    _cutoff_date = "N/A"
+    _balance = "N/A"
+    if _meta_3d_path.exists():
+        import json as _json
+        _m = _json.loads(_meta_3d_path.read_text())
+        _cutoff_date = _m.get("cutoff_date", "N/A")
+        _balance = _m.get("balance", "N/A")
+
+    with st.expander("🧠 Pipeline de Entrenamiento", expanded=True):
+        st.markdown(f"""
+**División Train / Test (temporal):**
+- **Cutoff date**: `{_cutoff_date}` (30 días antes del entrenamiento)
+- **Train**: todos los eventos ANTES del cutoff
+- **Test**: todos los eventos DESDE el cutoff en adelante
+- **Evaluación por ventana temporal**: ~8,308 eventos de test por horizonte
+
+**Buses de prueba (hold-out):** 10 buses totalmente excluidos del entrenamiento:
+```
+PFVL15  PFVL21  PFVK90  PFTF88  PDZH97
+PFYH17  PFVK64  PFYR84  PFYG94  PFTF84
+```
+Estos buses se usan para medir la capacidad de **generalización a buses nunca vistos**.
+
+**Balanceo de clases:**
+- Desbalance natural: ~5-18% de eventos positivos (falla) según el horizonte
+- Técnica: **SMOTE** (Synthetic Minority Oversampling) + `scale_pos_weight`
+- `scale_pos_weight` = (negativos / positivos) × multiplicador (1.0 por defecto)
+  - 3d: 7.54 | 5d: 5.05 | 7d: 3.58
+        """)
+
+    # ── 5. Modelo ────────────────────────────────────────────────────
+    with st.expander("🤖 Modelo: XGBoost", expanded=True):
+        st.markdown(f"""
+**Algoritmo**: XGBoost Classifier (3 modelos independientes, uno por horizonte)
+
+**Hiperparámetros** (optimizados):
+
+| Parámetro | Valor | Descripción |
+|---|---|---|
+| `n_estimators` | 1200 | Número de árboles |
+| `max_depth` | 10 | Profundidad máxima |
+| `learning_rate` | 0.02 | Tasa de aprendizaje |
+| `subsample` | 0.85 | Fracción de muestras por árbol |
+| `colsample_bytree` | 0.85 | Fracción de features por árbol |
+| `min_child_weight` | 3 | Peso mínimo por hoja |
+| `gamma` | 0.1 | Reducción mínima de pérdida |
+| `reg_alpha` | 0.1 | Regularización L1 |
+| `reg_lambda` | 2.0 | Regularización L2 |
+| `early_stopping_rounds` | 50 | Detención temprana |
+| `device` | CUDA (GPU) | Aceleración |
+
+**Umbral de decisión interno** (seleccionado por validación):
+- 3d: **0.85** | 5d: **0.80** | 7d: **0.80**
+- Nota: el dashboard usa un umbral unificado de **{DECISION_THRESHOLD}** para todos los horizontes
+        """)
+
+    # ── 6. Features ─────────────────────────────────────────────────
+    with st.expander("📊 Features (186 variables predictivas)", expanded=False):
+        st.markdown("""
+Las features se generan a partir del historial de cada bus, agrupadas en las siguientes familias:
+
+| Familia | Variables | Descripción |
+|---|---|---|
+| **Bus History** | 5 | Total eventos/correctivos/fallas históricos, tasas |
+| **Rolling Windows** | 10 | Conteo de eventos/correctivos/tasa de falla en últimos {3,5,7}d |
+| **Event-level** | 14 | Repuestos, duración OT, horas desde creación, keywords técnicos |
+| **Inspecciones** | 5 | Highs/Mediums/Lows de REGB/IT, no presentado, sistemas |
+| **Bus Stats** | 5 | Media/std/min/max de días entre eventos, máx correctivos previos |
+| **Cause-based** | ~15 | Días desde misma causa, racha, diversidad de causas, conteos por causa |
+| **System** | ~20 | Conteos por sistema/taller/unidad de negocio en {7,30}d |
+| **Inventory** | 14 | Repuestos, uuid gestión, filas correctivo en {7,30}d |
+| **Text Patterns** | ~30 | Keywords técnicos (motor, freno, batería, etc.) en {7,30}d |
+| **Event Type** | 20 | Conteos por tipo (CORR/PREV/REGB/IT) en {7,30,60,180}d |
+| **Severity** | ~10 | Highs/Mediums/Lows por tipo de inspección |
+| **Trends** | 6 | Pendiente de eventos/fallas en {7,30,60}d |
+| **Bus Age** | 4 | Edad del bus en días, eventos totales, preventivo reciente |
+| **Temporal** | 3 | Mes, día de semana, fin de mes |
+        """)
+
+    # ── 7. Resultados del Test Set ──────────────────────────────────
+    _eval_summary_path = Path("outputs/metrics/evaluation_summary_voy_redbus.json")
+    if _eval_summary_path.exists():
+        import json as _json
+        _eval = _json.loads(_eval_summary_path.read_text())
+    else:
+        _eval = {}
+
+    with st.expander("📈 Resultados del Test Set", expanded=True):
+        if _eval:
+            st.markdown("**Métricas sobre el conjunto de test temporal (eventos después del cutoff):**")
+            for _w in ["3", "5", "7"]:
+                _r = _eval.get(_w, {})
+                if not _r:
+                    continue
+                _cm = _r.get("confusion_matrix", [])
+                if _cm:
+                    _tn, _fp, _fn, _tp = _cm[0][0], _cm[0][1], _cm[1][0], _cm[1][1]
+                else:
+                    _tn = _fp = _fn = _tp = 0
+                st.markdown(f"""
+**Ventana {_w}d** (umbral de decisión interno = {_r.get('decision_threshold', 'N/A')})
+- ACC = {_r.get('accuracy', 0)*100:.1f}% | Precision = {_r.get('precision', 0)*100:.1f}% | Recall = {_r.get('recall', 0)*100:.1f}%
+- F1 = {_r.get('f1', 0):.3f} | Specificity = {_r.get('specificity', 0)*100:.1f}% | AUC-ROC = {_r.get('auc_roc', 'N/A')}
+- TP={_tp} TN={_tn} FP={_fp} FN={_fn}
+- Test events: {_r.get('test_positives', 0)} positivos + {_r.get('test_negatives', 0)} negativos = {_r.get('test_positives', 0) + _r.get('test_negatives', 0)} total
+- Baseline (mayoritaria): {_r.get('baseline_always_majority', 0)*100:.1f}%
+""")
+        else:
+            st.info("Reporte de evaluación no disponible.")
+
+    # ── 8. Holdout Buses ────────────────────────────────────────────
+    _test_bus_path = Path("outputs/metrics/test_buses_summary_voy_redbus.json")
+    if _test_bus_path.exists():
+        import json as _json
+        _test_bus = _json.loads(_test_bus_path.read_text())
+    else:
+        _test_bus = {}
+
+    with st.expander("🧪 Resultados — Buses de Prueba (Hold-out)", expanded=False):
+        if _test_bus:
+            st.markdown("""
+**10 buses no vistos durante el entrenamiento**, para medir generalización:
+```
+PFVL15  PFVL21  PFVK90  PFTF88  PDZH97
+PFYH17  PFVK64  PFYR84  PFYG94  PFTF84
+```
+""")
+            for _w in ["3", "5", "7"]:
+                _r = _test_bus.get(_w, {})
+                if not _r:
+                    continue
+                _cm = _r.get("confusion_matrix", [])
+                if _cm:
+                    _tn, _fp, _fn, _tp = _cm[0][0], _cm[0][1], _cm[1][0], _cm[1][1]
+                else:
+                    _tn = _fp = _fn = _tp = 0
+                st.markdown(f"""
+**Ventana {_w}d** ({_r.get('test_size', 0)} eventos):
+- ACC = {_r.get('accuracy', 0)*100:.1f}% | Precision = {_r.get('precision', 0)*100:.1f}% | Recall = {_r.get('recall', 0)*100:.1f}%
+- F1 = {_r.get('f1', 0):.3f} | AUC-ROC = {_r.get('auc_roc', 'N/A')}
+- TP={_tp} TN={_tn} FP={_fp} FN={_fn}
+""")
+        else:
+            st.info("Reporte de holdout no disponible.")
+
+    # ── 9. Shadow Evaluation ───────────────────────────────────────
+    with st.expander("🕵️ Shadow Evaluation — Buses Piloto", expanded=True):
+        st.markdown(f"""
+Evaluación de todas las predicciones (excluyendo severidad LOW) contra eventos reales,
+usando umbral **{DECISION_THRESHOLD}** para los buses piloto FLXS22 (Diesel), FLXS23 (Diesel), LWTK42 (Eléctrico).
+
+**Métricas globales por horizonte:**
+""")
+        for _h in sorted(horizons, key=int):
+            _tm = shadow_report["por_horizonte"][_h]["threshold_metrics"].get(str(DECISION_THRESHOLD), {})
+            _cm = _tm.get("confusion_matrix", [])
+            if _cm:
+                _tn, _fp, _fn, _tp = _cm[0][0], _cm[0][1], _cm[1][0], _cm[1][1]
+            else:
+                _tn = _fp = _fn = _tp = 0
+            _cr = _tm.get("classification_report", {}).get("1", {})
+            _auc = shadow_report["por_horizonte"][_h].get("auc_roc", "N/A")
+            _n = shadow_report["por_horizonte"][_h].get("total_predicciones", 0)
+            st.markdown(f"""
+**{_h} días** ({_n} predicciones):
+- ACC = {_tm.get('accuracy', 0)*100:.1f}% | Precision = {_cr.get('precision', 0)*100:.1f}% | Recall = {_cr.get('recall', 0)*100:.1f}%
+- F1 = {_cr.get('f1-score', 0):.3f} | AUC-ROC = {_auc}
+- TP={_tp} TN={_tn} FP={_fp} FN={_fn}
+
+**Por bus:**
+""")
+            _bus_data = shadow_report.get("por_bus", {}).get(_h, {})
+            for _bus, _bm in _bus_data.items():
+                if "error" in _bm:
+                    continue
+                _btm = _bm.get("threshold_metrics", {}).get(str(DECISION_THRESHOLD), {})
+                _bcm = _btm.get("confusion_matrix", [])
+                if _bcm:
+                    btn, bfp, bfn, btp = _bcm[0][0], _bcm[0][1], _bcm[1][0], _bcm[1][1]
+                    bacc = (btp + btn) / (btp + btn + bfp + bfn) if (btp + btn + bfp + bfn) > 0 else 0
+                else:
+                    btn = bfp = bfn = btp = 0
+                    bacc = 0
+                st.markdown(f"""
+  - **{_bus}** (n={_bm.get('total_predicciones', 0)}): ACC = {bacc*100:.1f}%  TP={btp} TN={btn} FP={bfp} FN={bfn}
+""")
+
+    # ── 10. Sistema de Alertas ─────────────────────────────────────
+    with st.expander("🔔 Sistema de Alertas", expanded=True):
+        st.markdown(f"""
+**¿Cómo funciona la predicción?**
+
+Para cada evento de mantenimiento de cada bus, los 3 modelos (3d, 5d, 7d) calculan
+un **riesgo** (probabilidad de 0% a 100%) de que ocurra una falla dentro de cada ventana.
+
+**¿Las alertas son hacia adelante o hacia atrás?**
+- Las alertas **miran hacia adelante**: "Este bus tiene un X% de probabilidad de fallar
+  en los próximos N días"
+- Cada predicción se genera para un evento y un horizonte específico
+- Si la probabilidad supera el umbral ({DECISION_THRESHOLD} = 60%), se emite una alerta
+
+**¿Cómo se mide la precisión?**
+- Una vez que la ventana de tiempo se cierra (pasan los N días), se verifica si
+  realmente ocurrió una falla en ese período
+- Si la alerta se activó y hubo falla → **TP** (acierto)
+- Si la alerta se activó y NO hubo falla → **FP** (falsa alarma)
+- Si no hubo alerta y no hubo falla → **TN** (tranquilidad)
+- Si no hubo alerta pero sí hubo falla → **FN** (falla no detectada)
+
+**Riesgo unificado** en el dashboard = máxima probabilidad entre los 3 horizontes.
+        """)
+
+    # ── 11. TP/TN/FP/FN ────────────────────────────────────────────
+    with st.expander("📊 Precisión de las Predicciones (TP / TN / FP / FN)", expanded=False):
+        st.markdown(f"""
+| Resultado | Emoji | Significado | Color |
+|---|---|---|---|
+| **TP** (True Positive) | {OUTCOME_EMOJI.get('TP', '✅')} | Alerta correcta: se predijo la falla y ocurrió | Verde |
+| **TN** (True Negative) | {OUTCOME_EMOJI.get('TN', '⬜')} | Tranquilidad: no se predijo y no pasó nada | Gris |
+| **FP** (False Positive) | {OUTCOME_EMOJI.get('FP', '🟠')} | Falsa alarma: se predijo pero no ocurrió | Naranja |
+| **FN** (False Negative) | {OUTCOME_EMOJI.get('FN', '🔴')} | Falla no detectada: ocurrió sin alerta previa | Rojo |
+
+**ACC (Accuracy)** = (TP + TN) / (TP + TN + FP + FN)
+
+**Precision** = TP / (TP + FP) — de las alertas emitidas, qué proporción fueron correctas
+
+**Recall** = TP / (TP + FN) — de las fallas reales, qué proporción fueron anticipadas
+
+**F1-Score** = 2 × (Precision × Recall) / (Precision + Recall) — promedio armónico
+
+**Specificity** = TN / (TN + FP) — de los eventos sin falla, qué proporción se clasificaron correctamente
+        """)
+
+
+    # ── 13. Comandos ───────────────────────────────────────────────
+    with st.expander("💻 Comandos Útiles", expanded=False):
+        st.markdown(f"""
+```bash
+# Pipeline completo (ETL → Train → Infer)
+python3 scripts/run_pipeline.py --local-json
+
+# Shadow Evaluation (genera el reporte que alimenta este dashboard)
+python3 scripts/evaluate_shadow.py
+
+# Consultar predicciones de un bus específico
+python3 scripts/consultar_bus.py FLXS22
+
+# Top 10 buses con mayor riesgo
+python3 scripts/consultar_bus.py --top 10
+
+# Daily inference programada
+python3 scripts/daily_inference.py
+
+# Experimentos
+python3 scripts/run_experiment.py 009_th06_all --local-json
+python3 scripts/compare_experiments.py
+
+# Lanzar este dashboard
+streamlit run app.py
+```
+        """)
+
+    st.stop()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HEADER — Global pipeline metrics
@@ -375,47 +717,6 @@ kpi5.metric("📅 Última predicción",
 
 st.divider()
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION: GLOBAL RESULTS — per-window model performance
-# ═══════════════════════════════════════════════════════════════════════════
-
-st.subheader("📊 Resultados Globales por Ventana")
-st.caption("Para cada predicción se verifica si ocurrió una falla real en los días siguientes.")
-
-global_rows = []
-for h in horizons:
-    m = shadow_report["por_horizonte"][h]
-    tm = m["threshold_metrics"].get(str(DECISION_THRESHOLD), {})
-    cm = tm.get("confusion_matrix", [])
-    if cm:
-        tn, fp, fn, tp = cm[0][0], cm[0][1], cm[1][0], cm[1][1]
-        correctas = tp + tn
-        incorrectas = fp + fn
-    else:
-        correctas = incorrectas = 0
-
-    global_rows.append({
-        "Ventana": f"{h} días",
-        "Predicciones": fmt_num(int(m.get('total_predicciones', 0))),
-        "Correctas ✅": fmt_num(correctas),
-        "Incorrectas ❌": fmt_num(incorrectas),
-    })
-
-global_rows.append({
-    "Ventana": "**TOTAL**",
-    "Predicciones": fmt_num(total_all),
-    "Correctas ✅": fmt_num(total_tp + total_tn),
-    "Incorrectas ❌": fmt_num(total_fp + total_fn),
-})
-
-st.dataframe(global_rows, width="stretch", hide_index=True)
-
-st.info(
-    "📈 Las ventanas indican el plazo de la predicción: 3 días (muy corto plazo), "
-    "5 días (corto plazo), 7 días (semanal)."
-)
-
-st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION: CURRENT FLEET RISK
@@ -518,7 +819,7 @@ else:
         ))
         fig_risk.update_layout(
             title="Top 20 buses con mayor riesgo",
-            xaxis=dict(title="Riesgo unificado", tickformat="%"),
+            xaxis=dict(title="Riesgo unificado", tickformat=".0%"),
             yaxis=dict(title=""),
             height=400,
             margin=dict(l=0, r=0, t=30, b=0),
@@ -641,17 +942,4 @@ st.divider()
 # FOOTER
 # ═══════════════════════════════════════════════════════════════════════════
 
-with st.expander("ℹ️ Detalles técnicos"):
-    st.markdown(f"""
-**Modelo:** XGBoost | **Config:** `experiments/009_th06_all`
-
-**¿Cómo funciona?**
-1. Se entrena un modelo por cada ventana (3, 5, 7 días) con datos históricos recientes.
-2. Para cada evento de cada bus, el modelo calcula un riesgo (0-100%).
-3. Si el riesgo supera el umbral ({DECISION_THRESHOLD}), se emite una alerta.
-4. Cada predicción se compara contra la realidad para medir la efectividad.
-
-**Comandos:**
-- `python3 scripts/evaluate_shadow.py` — generar reporte
-- `python3 scripts/consultar_bus.py FLXS22` — consultar predicciones CLI
-    """)
+st.caption("📖 Para más detalles, ve a la sección Documentación en el sidebar.")

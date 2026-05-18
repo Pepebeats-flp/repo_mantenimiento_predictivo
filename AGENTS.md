@@ -38,7 +38,15 @@ streamlit run app.py                                        # Launch Streamlit d
 ## Daily Inference (scheduled)
 ```bash
 python3 scripts/daily_inference.py                          # Fetch from Firestore, predict, save log
+python3 scripts/daily_inference.py --local-json             # From local JSON files
+python3 scripts/daily_inference.py --recent-days 30         # Only process last N days (faster)
 ```
+
+## Fetch Fresh Data + Predict + Evaluate (all-in-one)
+```bash
+python3 scripts/fetch_and_predict.py --recent-days 4        # Download Firestore → predict last 4d → save base/eventos/preds
+```
+⚠️ Requires `slared-4de9d5a1e961.json` in project root. Downloads ALL Firestore collections (~3 min), processes full ETL (~6 min), runs feature engineering on all events (~2.5 min), filters to recent window, infers, saves. Caches `base.parquet` and `eventos_all.parquet` for reuse.
 
 ## Query Buses
 ```bash
