@@ -6,6 +6,7 @@ import re
 import unicodedata
 from typing import Any, Iterable
 
+import numpy as np
 import pandas as pd
 
 from .data_loader import flatten_firebase, flatten_nested_json_fields
@@ -46,54 +47,144 @@ KEYWORD_PATTERNS = {
     "keyword_espejo": ("ESPEJO",),
 }
 
+INCIDENT_PATTERNS = {
+    "es_vandalismo": ("VANDALISMO", "VANDALICO"),
+    "es_siniestro": ("SINIESTRO", "ACCIDENTE"),
+    "es_choque": ("CHOQUE", "COLISION", "GOLPE"),
+    "es_incendio": ("INCENDIO", "FUEGO", "QUEMAD"),
+    "es_no_presentado": ("NO PRESENTADO", "NO SE PRESENTO", "NO LLEGA", "BUS NO PRESENTADO"),
+}
+
 CAUSA_SISTEMA_REGEX = {
 
     "FRENOS": [
         r"\bFRENO[S]?\b",
         r"\bPASTILLA[S]?\b",
         r"\bDISCO[S]?\b",
-        r"\bABS\b"
+        r"\bABS\b",
+        r"\bZAPATA[S]?\b",
+        r"\bTAMBOR\b",
+        r"\bCALIPER\b",
+        r"\bFRENO DE\b",
+        r"\bSISTEMA DE FRENO\b",
     ],
 
     "SUSPENSION": [
         r"\bAMORTIGUADOR(ES)?\b",
         r"\bSUSPENSION\b",
-        r"\bBUJE[S]?\b"
+        r"\bBUJE[S]?\b",
+        r"\bRESORTE[S]?\b",
+        r"\bBALANCIN\b",
+        r"\bROTULA[S]?\b",
+        r"\bSILENTBLOCK\b",
+        r"\bMUELLE[S]?\b",
+        r"\bBARRA DIRECC\b",
+        r"\bDIRECCION\b",
     ],
 
     "PUERTAS": [
         r"\bPUERTA[S]?\b",
+        r"\bCIERRE\b",
+        r"\bAPERTURA DE PUERTA\b",
+        r"\bMECANISM\b",
     ],
 
     "CARROCERIA": [
         r"\bVIDRIO[S]?\b",
-        r"\bPARACHOQUE[S]?\b"
+        r"\bPARACHOQUE[S]?\b",
+        r"\bCARROCERIA\b",
+        r"\bCARROCER\b",
+        r"\bCHASIS\b",
+        r"\bPINTURA\b",
+        r"\bOXIDO\b",
+        r"\bABOLLADURA\b",
+        r"\bRAJADURA\b",
+        r"\bPANEL\b",
+        r"\bCIELO\b",
+        r"\bPISO\b",
+        r"\bVENTANA[S]?\b",
+        r"\bESPEJO[S]?\b",
+        r"\bPARABRISA[S]?\b",
+        r"\bASIENTO[S]?\b",
+        r"\bCINTURON\b",
+        r"\bDESPREND\b",
+        r"\bESTRUCTUR\b",
+        r"\bDANO[S]?\b",
+        r"\bDANADO\b",
+        r"\bGOTERA\b",
+        r"\bFILTRACION\b",
+        r"\bRAMPA\b",
+        r"\bPASAMANOS\b",
     ],
 
     "CLIMATIZACION": [
         r"\bAIRE\b",
         r"\bVENTILADOR\b",
-        r"\bEVAPORADOR\b"
+        r"\bEVAPORADOR\b",
+        r"\bCLIMATIZACION\b",
+        r"\bCLIMATIZAC\b",
+        r"\bAIRE ACOND\b",
+        r"\bCALEFACC\b",
+        r"\bTEMPERATURA\b",
     ],
 
     "RUEDAS": [
         r"\bNEUMATICO[S]?\b",
-        r"\bLLANTA[S]?\b"
+        r"\bLLANTA[S]?\b",
+        r"\bRUEDA[S]?\b",
+        r"\bDESGASTE\b",
+        r"\bVULCANIZACION\b",
+        r"\bGOMERIA\b",
     ],
 
     "MOTOR": [
         r"\bMOTOR\b",
         r"\bACEITE\b",
         r"\bCORREA[S]?\b",
-        r"\bVALVULA[S]?\b"
+        r"\bVALVULA[S]?\b",
+        r"\bEMBRAGUE\b",
+        r"\bREFRIGERANTE\b",
+        r"\bRADIADOR\b",
+        r"\bTURBO\b",
+        r"\bINYECTOR\b",
+        r"\bBOMBA DE\b",
+        r"\bCOMPRESOR\b",
+        r"\bESCAPE\b",
+        r"\bEMISION\b",
+        r"\bCILINDRO[S]?\b",
+        r"\bPISTON\b",
+        r"\bCULATA\b",
+        r"\bCARTER\b",
+        r"\bENFRIADOR\b",
+        r"\bTRACCION\b",
+        r"\bPOTENCIA\b",
+        r"\bSONDA\b",
+        r"\bFILTRO\b",
+        r"\bCAMPANA\b",
     ],
 
     "ELECTRICO": [
         r"\bBATERIA[S]?\b",
         r"\bALTERNADOR\b",
         r"\bFUSIBLE[S]?\b",
-        r"\bSENSOR(ES)?\b"
-    ]
+        r"\bSENSOR(ES)?\b",
+        r"\bELECTRIC\b",
+        r"\bLUCES\b",
+        r"\bFARO[S]?\b",
+        r"\bFOCO[S]?\b",
+        r"\bCORTOCIRCUITO\b",
+        r"\bTABLERO\b",
+        r"\bARRANQUE\b",
+        r"\bCARGADOR\b",
+        r"\bCABLEADO\b",
+        r"\bCONEXION ELECTR\b",
+    ],
+
+    "SEGURIDAD": [
+        r"\bEXTINTOR\b",
+        r"\bCINTURON SEGURIDAD\b",
+        r"\bSEGURIDAD\b",
+    ],
 
 }
 
@@ -369,6 +460,37 @@ def _add_keyword_indicators(df: pd.DataFrame, source_column: str) -> pd.DataFram
     return keyword_df
 
 
+def _add_incident_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Create binary incident type flags from observacion_clean and causa_origen_clean."""
+    df["_obs_upper"] = df["observacion_clean"].fillna("").astype(str).str.upper()
+    df["_causa_upper"] = df["causa_origen_clean"].fillna("").astype(str).str.upper()
+    df["_obs_inspeccion_upper"] = df.get("obs_inspeccion_clean", pd.Series("")).fillna("").astype(str).str.upper()
+
+    for flag_name, keywords in INCIDENT_PATTERNS.items():
+        mask = np.zeros(len(df), dtype=bool)
+        for kw in keywords:
+            mask |= (
+                df["_obs_upper"].str.contains(kw, na=False)
+                | df["_causa_upper"].str.contains(kw, na=False)
+                | df["_obs_inspeccion_upper"].str.contains(kw, na=False)
+            )
+        df[flag_name] = mask.astype(int)
+
+    # es_no_mecanico: incidente en evento CARROCERIA
+    df["es_no_mecanico"] = (
+        (
+            df["es_vandalismo"]
+            | df["es_siniestro"]
+            | df["es_choque"]
+            | df["es_incendio"]
+            | df["es_no_presentado"]
+        ).astype(int)
+    )
+
+    df = df.drop(columns=["_obs_upper", "_causa_upper", "_obs_inspeccion_upper"])
+    return df
+
+
 def extract_additional_fields(df: pd.DataFrame) -> pd.DataFrame:
     """Extend the cleaned base with nested JSON summaries and normalized columns."""
 
@@ -439,7 +561,8 @@ def extract_additional_fields(df: pd.DataFrame) -> pd.DataFrame:
     enriched_df = clean_textual_fields(enriched_df)
     enriched_df = normalize_categorical_columns(enriched_df)
     enriched_df = _add_keyword_indicators(enriched_df, "repuestos_descripcion_texto_clean")
-    enriched_df = _reconstruct_causa_sistema(enriched_df) 
+    enriched_df = _reconstruct_causa_sistema(enriched_df)
+    enriched_df = _add_incident_indicators(enriched_df) 
     for source, target in (
         ("repuestos_count", "tiene_repuestos"),
         ("uuid_gestion_count", "tiene_uuid_gestion"),
@@ -526,7 +649,7 @@ def summarize_data_quality(
 
 
 SIGNIFICANT_FAILURE_CATEGORIES = frozenset({
-    "FRENOS", "MOTOR", "ELECTRICO", "CLIMATIZACION", "RUEDAS", "SUSPENSION", "PUERTAS",
+    "FRENOS", "MOTOR", "ELECTRICO", "CLIMATIZACION", "RUEDAS", "SUSPENSION", "PUERTAS", "SEGURIDAD",
 })
 
 FAILURE_TIPO_MAP: dict[str, str] = {
@@ -702,6 +825,24 @@ def create_eventos_dataframe(base_df: pd.DataFrame) -> pd.DataFrame:
     return eventos_df
 
 
+def classify_severity(row: dict[str, Any]) -> str:
+    """Clasifica severidad de un evento de forma unificada.
+
+    Usada por todos los scripts de inferencia para consistencia.
+    """
+    hp = float(row.get("repuestos_count_evento", 0) or 0)
+    dur = float(row.get("duracion_ot_horas_prom_evento", 0) or 0)
+    kw = float(row.get("num_keywords_tecnicos_evento", 0) or 0)
+    highs = float(row.get("inspeccion_total_highs_evento", 0) or 0)
+    if not hp and dur < 2 and kw == 0 and highs == 0:
+        return "LOW"
+    if hp and dur > 4:
+        return "HIGH"
+    if highs > 0:
+        return "HIGH"
+    return "MEDIUM"
+
+
 def _aggregate_event_group(group: pd.DataFrame) -> pd.Series:
     """Build additional event-level summaries from enriched corrective rows."""
 
@@ -796,6 +937,11 @@ def _aggregate_inspection_group(group: pd.DataFrame) -> pd.Series:
         "BUS NO PRESENTADO", case=False, na=False
     ).any()
     aggregated["flag_no_presentado"] = int(no_presentado)
+
+    # Also aggregate incident flags
+    for flag_col in ["es_vandalismo", "es_siniestro", "es_choque", "es_incendio", "es_no_presentado"]:
+        if flag_col in group.columns:
+            aggregated[flag_col] = int(group[flag_col].fillna(0).max())
 
     # Count how many grupos (system groups) in IT inspections
     group_vals = group.get("group", pd.Series(dtype=object))

@@ -179,25 +179,29 @@ def shadow_evaluate(
     thresholds: Iterable[float] = (0.3, 0.4, 0.5, 0.6, 0.7),
     exclude_low_severity: bool = True,
 ) -> dict[str, Any]:
-    """Evalúa predicciones vs eventos reales para Shadow Mode.
+    """Evalua predicciones vs eventos reales para Shadow Mode.
 
-    Para cada predicción (bus, fecha, horizonte H), determina si hubo
-    un evento correctivo real en los H días posteriores usando la misma
-    lógica shift(-1) del entrenamiento.
+    Para cada prediccion (bus, fecha, horizonte H), determina si hubo
+    un evento de falla real en los H dias posteriores.
+
+    Soporta dos formatos de predicciones:
+    - Nuevo (bus-dia): columnas placa_patente, fecha_prediccion, horizon_days, ...
+    - Antiguo (evento): columnas placa_patente, fecha_evento, horizon_days, ...
 
     Args:
-        predictions: DataFrame con columnas placa_patente, fecha_evento,
-                     horizon_days, probability, alert, severity
-        eventos_df: DataFrame con eventos correctivos (placa_patente, fecha_evento)
-        buses_piloto: Lista de buses a reportar individualmente (None = todos)
-        thresholds: Lista de thresholds a evaluar
-        exclude_low_severity: Si True, excluye eventos LOW de la evaluación
+        predictions: DataFrame con predicciones.
+        eventos_df: DataFrame con eventos de falla (placa_patente, fecha_evento).
+        buses_piloto: Lista de buses a reportar individualmente (None = todos).
+        thresholds: Lista de thresholds a evaluar.
+        exclude_low_severity: Si True, excluye eventos LOW de la evaluacion.
 
     Returns:
-        Dict con métricas por horizonte y por bus
+        Dict con metricas por horizonte y por bus.
     """
     preds = predictions.copy()
-    preds["fecha_evento"] = pd.to_datetime(preds["fecha_evento"])
+
+    date_col = "fecha_prediccion" if "fecha_prediccion" in preds.columns else "fecha_evento"
+    preds[date_col] = pd.to_datetime(preds[date_col])
 
     eventos = eventos_df.copy()
     eventos["fecha_evento"] = pd.to_datetime(eventos["fecha_evento"])
@@ -222,25 +226,30 @@ def shadow_evaluate(
         if sub_preds.empty:
             continue
 
-        sub_preds = sub_preds.sort_values(["placa_patente", "fecha_evento"])
+        sub_preds = sub_preds.sort_values(["placa_patente", date_col])
 
-        next_event = (
-            eventos.sort_values(["placa_patente", "fecha_evento"])
-            .groupby("placa_patente")["fecha_evento"]
-            .shift(-1)
-        )
-        eventos_next = eventos[["placa_patente", "fecha_evento"]].copy()
-        eventos_next["prox_evento"] = next_event
-
-        sub_preds = sub_preds.merge(
-            eventos_next[["placa_patente", "fecha_evento", "prox_evento"]],
-            on=["placa_patente", "fecha_evento"],
-            how="left",
+        eventos_sorted = eventos.sort_values(["placa_patente", "fecha_evento"])
+        sub_preds["_evento_idx"] = (
+            eventos_sorted.groupby("placa_patente")["fecha_evento"]
+            .apply(lambda g: g.searchsorted(sub_preds.loc[g.index.get_level_values(0)[0] if len(g.index) > 0 else 0, date_col], side="left") if not g.index.empty else np.array([]))
+            .reset_index(drop=True)
         )
 
-        delta = (sub_preds["prox_evento"] - sub_preds["fecha_evento"]).dt.days
-        y_true = delta.notna() & delta.le(ventana)
-        y_true = y_true.astype(int).values
+        merged = sub_preds.merge(
+            eventos[["placa_patente", "fecha_evento"]],
+            on="placa_patente", how="left", suffixes=("", "_evento"),
+        )
+        merged["delta_dias"] = (
+            (merged["fecha_evento"] - merged[date_col]).dt.days
+        )
+        merged["en_ventana"] = (merged["delta_dias"] >= 0) & (merged["delta_dias"] <= ventana)
+
+        y_true = (
+            merged.groupby(sub_preds.index)
+            .apply(lambda g: g["en_ventana"].any())
+            .reindex(sub_preds.index, fill_value=False)
+            .astype(int).values
+        )
 
         y_score = sub_preds["probability"].values
 
@@ -257,11 +266,17 @@ def shadow_evaluate(
                 if bus_preds.empty:
                     continue
 
-                bus_delta = (
-                    (bus_preds["prox_evento"] - bus_preds["fecha_evento"]).dt.days
-                )
-                bus_y_true = bus_delta.notna() & bus_delta.le(ventana)
-                bus_y_true = bus_y_true.astype(int).values
+                bus_merged = eventos[eventos["placa_patente"] == bus].copy()
+                bus_y_true = []
+                for _, pred_row in bus_preds.iterrows():
+                    pred_date = pred_row[date_col]
+                    future_fails = bus_merged[
+                        (bus_merged["fecha_evento"] >= pred_date)
+                        & (bus_merged["fecha_evento"] <= pred_date + pd.Timedelta(days=int(ventana)))
+                    ]
+                    bus_y_true.append(int(not future_fails.empty))
+
+                bus_y_true = np.array(bus_y_true)
                 bus_y_score = bus_preds["probability"].values
 
                 if len(bus_y_true) < 5:
@@ -271,7 +286,6 @@ def shadow_evaluate(
                     }
                     continue
 
-                # Skip if only one class present (can't compute meaningful metrics)
                 n_pos = int(bus_y_true.sum())
                 n_neg = len(bus_y_true) - n_pos
                 if n_pos == 0 or n_neg == 0:
